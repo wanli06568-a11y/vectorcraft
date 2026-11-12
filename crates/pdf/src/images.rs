@@ -15,6 +15,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
+use craft_pdf::write::backend as krilla;
 use image::imageops::FilterType;
 use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageFormat, ImageReader};
 use krilla::image::{BitsPerComponent, CustomImage, Image, ImageColorspace};
@@ -86,9 +87,10 @@ fn neutral(rgba: &[u8]) -> bool {
     rgba.as_chunks::<4>().0.iter().all(|p| p[0] == p[1] && p[1] == p[2])
 }
 
-/// Opaque colour `samples` (grey, RGB, or CMYK ink amounts, as `space` says) written losslessly.
-fn lossless(samples: Vec<u8>, space: ImageColorspace, width: u32, height: u32, interpolate: bool) -> Option<Image> {
-    Image::from_custom(Raw { color: Arc::new(samples), alpha: None, width, height, space }, interpolate).ok()
+/// Colour `samples` (grey, RGB, or CMYK ink amounts, as `space` says) with an optional `alpha`
+/// channel, written losslessly.
+fn lossless(samples: Vec<u8>, alpha: Option<Vec<u8>>, space: ImageColorspace, width: u32, height: u32, interpolate: bool) -> Option<Image> {
+    Image::from_custom(Raw { color: Arc::new(samples), alpha: alpha.map(Arc::new), width, height, space }, interpolate).ok()
 }
 
 /// [`from_rgba`] of pixels converted by `pixels` (when given).
@@ -97,6 +99,22 @@ pub(crate) fn from_rgba_in(mut rgba: Vec<u8>, width: u32, height: u32, interpola
         p.rgb_in_place(&mut rgba);
     }
     from_rgba(&rgba, width, height, interpolate, pixels)
+}
+
+/// A `width` × `height` image of CMYK ink amounts `inks` (four bytes a pixel), converted by
+/// `convert` (when given), with straight `alpha` (one byte a pixel) carried only when some pixel
+/// isn't opaque. `None` when the buffers don't hold that many pixels.
+pub(crate) fn from_inks(inks: Vec<u8>, alpha: Vec<u8>, width: u32, height: u32, interpolate: bool, convert: Option<&CmykPixels>) -> Option<Image> {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels == 0 || inks.len() as u64 != pixels * 4 || alpha.len() as u64 != pixels {
+        return None;
+    }
+    let alpha = alpha.iter().any(|a| *a < 255).then_some(alpha);
+    let (samples, space) = match convert {
+        Some(p) => p.convert(&inks),
+        None => (inks, ImageColorspace::Cmyk),
+    };
+    lossless(samples, alpha, space, width, height, interpolate)
 }
 
 /// The kinds of images the Compression section has settings for.
@@ -227,7 +245,11 @@ pub(crate) fn recode(bytes: &[u8], size: (f64, f64), c: &CompressionSettings, in
     let keep = Recoded { image: None, warning: None };
     let Ok(reader) = ImageReader::new(Cursor::new(bytes)).with_guessed_format() else { return keep };
     let jpeg = reader.format() == Some(ImageFormat::Jpeg);
-    let Ok(decoder) = reader.into_decoder() else { return keep };
+    let Ok(mut decoder) = reader.into_decoder() else { return keep };
+    // What the header declares is decoded within the image allowance, not whatever it asks for.
+    if decoder.set_limits(limits()).is_err() {
+        return keep;
+    }
     let dims = decoder.dimensions();
     use ExtendedColorType as T;
     let grey = matches!(decoder.original_color_type(), T::L1 | T::La1 | T::L2 | T::La2 | T::L4 | T::La4 | T::L8 | T::La8 | T::L16 | T::La16);
@@ -247,7 +269,7 @@ pub(crate) fn recode(bytes: &[u8], size: (f64, f64), c: &CompressionSettings, in
     if kept(&rule, dims, size, jpeg) && convert.is_none() {
         return Recoded { image: None, warning: rule.instead };
     }
-    let Some(img) = pixels.or_else(|| image::load_from_memory(bytes).ok()) else { return keep };
+    let Some(img) = pixels.or_else(|| decoded(bytes)) else { return keep };
     let mut rgba = resample(img, &rule, sized(&rule, dims, size)).into_rgba8();
     if kind == Kind::Mono {
         // Resampling greys the edges: back to black and white.
@@ -275,13 +297,44 @@ pub(crate) fn recode(bytes: &[u8], size: (f64, f64), c: &CompressionSettings, in
     Recoded { image, warning: rule.instead }
 }
 
+/// A colorized image's coverage (one sample a pixel, `w` × `h`, see
+/// [`ImageBlob::coverage`]) placed `size` points wide and high, resampled as the Compression
+/// settings `c` ask for monochrome images (when every sample is 0 or 255) or grayscale ones.
+pub(crate) fn coverage_sized(w: u32, h: u32, cover: Vec<u8>, size: (f64, f64), c: &CompressionSettings) -> Option<(u32, u32, Vec<u8>)> {
+    let mono = cover.iter().all(|v| *v == 0 || *v == 255);
+    let rule = rule(c, if mono { Kind::Mono } else { Kind::Gray });
+    let to = sized(&rule, (w, h), size);
+    if to == (w, h) {
+        return Some((w, h, cover));
+    }
+    let img = DynamicImage::ImageLuma8(image::GrayImage::from_raw(w, h, cover)?);
+    let mut out = resample(img, &rule, to).into_luma8();
+    if mono {
+        // Resampling greys the edges: back to covered and not.
+        for p in out.pixels_mut() {
+            p[0] = if p[0] >= 128 { 255 } else { 0 };
+        }
+    }
+    let (w, h) = out.dimensions();
+    Some((w, h, out.into_raw()))
+}
+
 /// [`recode`] of CMYK image `blob` ([`ImageBlob::cmyk`]): a JPEG already as asked is kept as it
 /// is when its numbers are (`convert` is `None`); otherwise its ink amounts are resampled,
-/// converted by `convert` and compressed again.
-pub(crate) fn recode_cmyk(blob: &ImageBlob, size: (f64, f64), c: &CompressionSettings, interpolate: bool, convert: Option<&CmykPixels>) -> Recoded {
+/// converted by `convert` and compressed again. With `alpha` (one sample a pixel, see
+/// [`mask_alpha`]) the image is lossless and carries it as its soft mask; `None` then when its
+/// inks can't be read.
+pub(crate) fn recode_cmyk(
+    blob: &ImageBlob,
+    size: (f64, f64),
+    c: &CompressionSettings,
+    interpolate: bool,
+    convert: Option<&CmykPixels>,
+    alpha: Option<Vec<u8>>,
+) -> Recoded {
     let rule = rule(c, Kind::Color);
     let jpeg = jpeg_components(&blob.bytes).is_some();
-    if jpeg && convert.is_none() {
+    if jpeg && convert.is_none() && alpha.is_none() {
         let dims = ImageReader::new(Cursor::new(blob.bytes.as_slice())).with_guessed_format().ok().and_then(|r| r.into_dimensions().ok());
         if dims.is_some_and(|d| kept(&rule, d, size, true)) {
             return Recoded { image: None, warning: rule.instead };
@@ -292,6 +345,11 @@ pub(crate) fn recode_cmyk(blob: &ImageBlob, size: (f64, f64), c: &CompressionSet
     };
     let dims = (inks.width, inks.height);
     let (width, height) = sized(&rule, dims, size);
+    let alpha = match alpha.map(|a| image::GrayImage::from_raw(inks.width, inks.height, a)) {
+        Some(Some(a)) => Some(resample(DynamicImage::ImageLuma8(a), &rule, (width, height)).into_luma8().into_raw()),
+        Some(None) => return Recoded { image: None, warning: None },
+        None => None,
+    };
     // The four inks resample as the four channels of an RGBA image do.
     let inks = match image::RgbaImage::from_raw(inks.width, inks.height, inks.data) {
         Some(img) => resample(DynamicImage::ImageRgba8(img), &rule, (width, height)).into_rgba8().into_raw(),
@@ -301,9 +359,49 @@ pub(crate) fn recode_cmyk(blob: &ImageBlob, size: (f64, f64), c: &CompressionSet
         Some(p) => p.convert(&inks),
         None => (inks, ImageColorspace::Cmyk),
     };
-    let image = jpeg_quality(&rule, jpeg).and_then(|q| to_jpeg(&samples, space, width, height, q, interpolate));
-    let image = image.or_else(|| lossless(samples, space, width, height, interpolate));
+    // JPEG needs opaque pixels.
+    let image = jpeg_quality(&rule, jpeg).filter(|_| alpha.is_none()).and_then(|q| to_jpeg(&samples, space, width, height, q, interpolate));
+    let image = image.or_else(|| lossless(samples, alpha, space, width, height, interpolate));
     Recoded { image, warning: rule.instead }
+}
+
+/// The most one image read here may allocate (bytes), as the image reader allows by default.
+const MAX_DECODE: u64 = 512 << 20;
+
+/// The decoder limits of an image read here: [`MAX_DECODE`] bytes.
+fn limits() -> image::Limits {
+    let mut l = image::Limits::default();
+    l.max_alloc = Some(MAX_DECODE);
+    l
+}
+
+/// `bytes` decoded within [`limits`]: an image whose header asks for more is not decoded.
+fn decoded(bytes: &[u8]) -> Option<DynamicImage> {
+    let mut r = ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?;
+    r.limits(limits());
+    r.decode().ok()
+}
+
+/// The alpha an opacity mask whose art is greyscale image `blob` alone gives the image of
+/// `width` × `height` pixels it covers pixel for pixel: the mask's luminance, over black where the
+/// mask image is transparent when it clips (`clip`), else over white. `None` when `blob` isn't
+/// that many pixels or isn't grey (the luminance of colours is the soft mask's to work out).
+pub(crate) fn mask_alpha(blob: &ImageBlob, width: u32, height: u32, clip: bool) -> Option<Vec<u8>> {
+    if blob.is_cmyk() {
+        return None;
+    }
+    // The size from the header first: a mask of another size, or too large to hold as RGBA, is
+    // not decoded at all.
+    let reader = ImageReader::new(Cursor::new(blob.bytes.as_slice())).with_guessed_format().ok()?;
+    if reader.into_dimensions().ok()? != (width, height) || u64::from(width) * u64::from(height) * 4 > MAX_DECODE {
+        return None;
+    }
+    let img = decoded(&blob.bytes)?.into_rgba8();
+    if img.dimensions() != (width, height) || !neutral(img.as_raw()) {
+        return None;
+    }
+    let back = if clip { 0 } else { 255 };
+    Some(img.pixels().map(|p| ((u32::from(p[0]) * u32::from(p[3]) + back * (255 - u32::from(p[3])) + 127) / 255) as u8).collect())
 }
 
 /// Opaque colour `samples` (grey, RGB, or CMYK ink amounts, as `space` says) as a JPEG at
@@ -320,6 +418,7 @@ fn to_jpeg(samples: &[u8], space: ImageColorspace, width: u32, height: u32, qual
             let t = if space == ImageColorspace::Rgb { ExtendedColorType::Rgb8 } else { ExtendedColorType::L8 };
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality).encode(samples, width, height, t).ok()?;
         }
+        ImageColorspace::DeviceN => return None,
     }
     Image::from_jpeg(out.into(), interpolate).ok()
 }

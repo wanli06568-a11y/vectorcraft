@@ -12,7 +12,7 @@ use vectorcraft_geom::FillRule;
 
 use super::appearance::{ItemTarget, item_target};
 use super::edit::selected_roots;
-use super::*;
+use super::{CommandSpec, Result, Session, bad, cmd, has_doc, ids_param, number_or, switch_or, targets};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -21,7 +21,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Overprint",
             [],
             None,
-            "{fill?: bool, stroke?: bool, item?: appearance item index|null, ids?} make fills and/or strokes overprint (Overprint Preview, Separations Preview) or knock out: item's, else every fill or stroke of the painted objects (groups: their contents; type: its characters too). Without item and ids, the Appearance panel's active item stands in when it is of that kind → {changed: objects}",
+            "{fill?: bool, stroke?: bool, item?: appearance item index|null, ids?|id?, target?: \"object\"|\"contents\"} make fills and/or strokes overprint (Overprint Preview, Separations Preview) or knock out: item's, else every fill or stroke of the painted objects (groups: their contents; type: its characters too). Without item and ids, the Appearance panel's active item stands in when it is of that kind → {changed: objects}",
             has_doc,
             set_overprint
         ),
@@ -30,7 +30,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Attributes",
             [],
             None,
-            "{ids?, item?} → {ids, overprintFill, overprintStroke, showCenter, imageMap: \"none\"|\"rectangle\"|\"polygon\", url, note, fillRule: \"nonZero\"|\"evenOdd\" (of the paths and compound paths in them), reversed (their subpaths run counter-clockwise on screen: Reverse Path Direction On), recentUrls: [newest first]} the Attributes panel's values for `ids` or the selection, overprint aimed as object.setOverprint aims; a value is null where they differ (or nothing has a fill, stroke or path)",
+            "{ids?|id?, item?, target?: \"object\"|\"contents\"} → {ids, overprintFill, overprintStroke, showCenter, imageMap: \"none\"|\"rectangle\"|\"polygon\", url, note, fillRule: \"nonZero\"|\"evenOdd\" (of the paths and compound paths in them), reversed (their subpaths run counter-clockwise on screen: Reverse Path Direction On), recentUrls: [newest first]} the Attributes panel's values for `ids` or the selection, overprint aimed as object.setOverprint aims; a value is null where they differ (or nothing has a fill, stroke or path)",
             has_doc,
             |s, p| Ok(attributes(s, p)?.to_json())
         ),
@@ -214,22 +214,23 @@ fn attributes(s: &Session, p: &Value) -> Result<AttributesInfo> {
 /// Overprint Black on `n` and its descendants; returns the objects changed.
 fn overprint_black_tree(n: &mut Node, op: &OverprintBlack, spots: &[String]) -> usize {
     let mut changed = usize::from(op.apply(n, spots));
-    for c in n.children_mut().into_iter().flatten() {
+    for c in n.children_mut().into_iter().flatten().filter(|c| !c.is_ruler_guide()) {
         changed += overprint_black_tree(Arc::make_mut(c), op, spots);
     }
     changed
 }
 
 pub(crate) fn overprint_black(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "edit.colors.overprintBlack";
     let op = OverprintBlack {
-        remove: bool_or(p, "remove", false),
-        min_k: (f64_or(p, "percentage", 100.0) / 100.0).clamp(0.0, 1.0) as f32,
-        fill: bool_or(p, "fill", true),
-        stroke: bool_or(p, "stroke", true),
-        rich: bool_or(p, "includeCmyBlacks", false),
-        spot: bool_or(p, "includeSpotBlacks", false),
+        remove: switch_or(p, "remove", false, C)?,
+        min_k: (number_or(p, "percentage", 100.0, C)? / 100.0).clamp(0.0, 1.0) as f32,
+        fill: switch_or(p, "fill", true, C)?,
+        stroke: switch_or(p, "stroke", true, C)?,
+        rich: switch_or(p, "includeCmyBlacks", false, C)?,
+        spot: switch_or(p, "includeSpotBlacks", false, C)?,
     };
-    let ids = match ids_param(p, "ids") {
+    let ids = match ids_param(p, "ids", C)? {
         Some(v) => v,
         None => selected_roots(s)?,
     };

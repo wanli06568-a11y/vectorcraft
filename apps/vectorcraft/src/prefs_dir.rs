@@ -24,6 +24,63 @@ pub fn install_fonts() {
     }
 }
 
+/// The folder `name` next to the settings, for what the user keeps: none in a run without
+/// preferences (`VECTORCRAFT_NO_PREFS`), which keeps nothing.
+fn store_dir(name: &str) -> Option<PathBuf> {
+    if std::env::var_os("VECTORCRAFT_NO_PREFS").is_some() {
+        return None;
+    }
+    Some(prefs_path_for("VectorCraft", "vectorcraft")?.parent()?.join(name))
+}
+
+/// Register the ICC profiles `color.loadProfile` kept in the `Color Profiles` folder (#2174), and
+/// keep the ones loaded from now on there. Before anything names a profile.
+pub fn attach_profile_store(session: &mut vectorcraft_engine::Session) {
+    if let Some(dir) = store_dir("Color Profiles") {
+        session.attach_profile_store(dir);
+    }
+}
+
+/// Make Edit › Color Settings kept in `Color Settings.json` the active ones (#6335), and keep them
+/// there when they change. After [`attach_profile_store`]: they may name a loaded profile.
+pub fn attach_color_settings(session: &mut vectorcraft_engine::Session) {
+    if let Some(path) = store_dir("Color Settings.json") {
+        session.attach_color_settings(path);
+    }
+}
+
+/// Install the plug-ins Install Plug-in kept in the `Plug-ins` folder (#2541), and keep the ones
+/// installed from now on there.
+pub fn attach_plugin_store(session: &mut vectorcraft_engine::Session) {
+    if let Some(dir) = store_dir("Plug-ins") {
+        session.attach_plugin_store(dir);
+    }
+}
+
+/// Have File › Scripts and `script.listInstalled` list the scripts of the `Scripts` folder. The
+/// folder is only read: the user makes it.
+pub fn attach_scripts_dir(session: &mut vectorcraft_engine::Session) {
+    if let Some(dir) = store_dir("Scripts") {
+        session.attach_scripts_dir(dir);
+    }
+}
+
+/// Take the saved PDF presets from the `PDF Presets` folder (#2168), and keep the ones saved from
+/// now on there. After the preferences were restored: the folder is the one place the presets live.
+pub fn attach_pdf_preset_store(session: &mut vectorcraft_engine::Session) {
+    if let Some(dir) = store_dir("PDF Presets") {
+        session.attach_pdf_preset_store(dir);
+    }
+}
+
+/// Keep the custom dictionary (Edit › Spelling › Add, Edit Custom Dictionary) in the
+/// `Custom Dictionary.txt` file next to the settings, one word per line, and take in its words.
+pub fn attach_custom_dictionary(session: &mut vectorcraft_engine::Session) {
+    if let Some(path) = store_dir("Custom Dictionary.txt") {
+        session.attach_custom_dictionary(path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

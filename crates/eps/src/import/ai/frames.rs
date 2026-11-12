@@ -40,6 +40,10 @@ pub(crate) fn text_frames(data: &[u8]) -> HashMap<(u32, usize), BezPath> {
             continue;
         }
         let Some(head) = seg.get(..art) else { continue };
+        // The type in a drawn look is a story of another text document (see `Reader::text_slot`).
+        if number_before(head, b"/FreeUndo") == Some(1.0) {
+            continue;
+        }
         let (Some(story), frame) = (number_before(head, b"/StoryIndex"), number_before(head, b"/FrameIndex").unwrap_or(0.0)) else { continue };
         if !(0.0..f64::from(u32::MAX)).contains(&story) || !(0.0..1e6).contains(&frame) {
             continue;
@@ -62,8 +66,8 @@ fn number_before(head: &[u8], key: &[u8]) -> Option<f64> {
     number(words(head.get(..k)?).last()?)
 }
 
-/// A path in the format's path operators (`m`, `l`/`L`, `c`/`C`, `v`/`V`, `y`/`Y`; any other
-/// operator ends the numbers before it).
+/// A path in the format's path operators (`m`, `l`/`L`, `c`/`C`, `v`/`V`, `y`/`Y`, closed by `n`,
+/// `f`, `s`, `b` or `h`; any other operator ends the numbers before it).
 fn path(text: &[u8]) -> Option<BezPath> {
     let mut bp = BezPath::new();
     let mut nums: Vec<f64> = vec![];
@@ -102,6 +106,12 @@ fn path(text: &[u8]) -> Option<BezPath> {
                 bp.curve_to(p(n - 4)?, q, q);
                 cur = Some(q);
             }
+            // The painting operators that close the path first (lower case), and `h`: an area's frame
+            // is closed, its last point the first again.
+            b"n" | b"f" | b"s" | b"b" | b"h" if cur.is_some() => {
+                bp.close_path();
+                cur = None;
+            }
             _ => {}
         }
         nums.clear();
@@ -123,6 +133,25 @@ mod tests {
         assert_eq!(f.len(), 2, "point type has no frame: {f:?}");
         assert_eq!(f[&(49, 0)].bounding_box(), kurbo::Rect::new(10.0, 20.0, 110.0, 80.0));
         assert_eq!(f[&(60, 1)].elements().len(), 2, "a curve, led by %_");
+        // The type in a drawn look counts its stories in another text document: its frame isn't
+        // that of the text object which has the same number in this one.
+        let look = String::from_utf8_lossy(doc).replacen("0 /FreeUndo", "1 /FreeUndo", 1).replacen("10 20 m", "500 20 m", 1);
+        let own = "/AI11Text :\r0 /FreeUndo ,\r0 /FrameIndex ,\r49 /StoryIndex ,\r/Art :\r1 2 m\r3 2 L\r3 4 L\rN\r;\r/ConfiningPath ,\r;\r";
+        let f = text_frames(format!("{look}{own}").as_bytes());
+        assert_eq!(f[&(49, 0)].bounding_box(), kurbo::Rect::new(1.0, 2.0, 3.0, 4.0));
         assert!(text_frames(b"/AI11Text : garbage").is_empty());
+    }
+
+    /// An area's frame painted with `n` (as the format writes it, the last point the first again)
+    /// is a closed path of its corners; one painted with `N` stays open.
+    #[test]
+    fn a_frame_painted_closed_is_closed() {
+        let doc = b"/AI11Text :\r0 /FreeUndo ,\r0 /FrameIndex ,\r3 /StoryIndex ,\r/Art :\rX=\r40 130 m\r40 250 L\r240 250 L\r240 130 L\r40 130 L\rn\rX+\r; /ConfiningPath ,\r;\r\
+            /AI11Text :\r0 /FreeUndo ,\r0 /FrameIndex ,\r4 /StoryIndex ,\r/Art :\rX=\r40 130 m\r40 250 L\r240 250 L\rN\rX+\r; /ConfiningPath ,\r;\r";
+        let f = text_frames(doc);
+        let closed = vectorcraft_geom::PathData::from_bezpath(&f[&(3, 0)]);
+        assert!(closed.subpaths[0].closed);
+        assert_eq!(closed.subpaths[0].anchors.len(), 4, "the last point merges with the first");
+        assert!(!vectorcraft_geom::PathData::from_bezpath(&f[&(4, 0)]).subpaths[0].closed);
     }
 }

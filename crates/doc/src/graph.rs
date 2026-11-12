@@ -127,7 +127,7 @@ impl crate::Document {
                 break;
             }
             let Some(name) = GraphDesign::clean_name(&d.name) else { continue };
-            if kept.iter().any(|k| k.name == name) || d.art.count() > GraphDesign::MAX_NODES {
+            if kept.iter().any(|k| k.name == name) || d.art.count_with_masks() > GraphDesign::MAX_NODES {
                 continue;
             }
             kept.push(GraphDesign { name, art: std::sync::Arc::new(GraphDesign::plain_art(&d.art)) });
@@ -136,9 +136,11 @@ impl crate::Document {
     }
 }
 
-/// The character style a graph's labels keep through regeneration once formatted (Format the text in graphs): the
-/// value axis numbers, the category labels (category axis, radar spokes, pie names) and the legend labels (beside or
-/// across the top, or in pie wedges). `None` draws the default 9 pt black.
+/// The character style and anti-aliasing method a graph's labels keep through regeneration once formatted (Format
+/// the text in graphs): the value axis numbers, the category labels (category axis, radar spokes, pie names) and the
+/// legend labels (beside or across the top, or in pie wedges). `None` draws the default 9 pt black. The `*_para`
+/// fields are the paragraph attributes each kind keeps the same way (`None`: the defaults); the graph still sets each
+/// label's alignment.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LabelStyles {
@@ -148,6 +150,22 @@ pub struct LabelStyles {
     pub categories: Option<crate::CharStyle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub legend: Option<crate::CharStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values_para: Option<crate::ParaStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub categories_para: Option<crate::ParaStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legend_para: Option<crate::ParaStyle>,
+    /// The anti-aliasing method the value axis numbers keep once set (Character panel › Anti-aliasing Method).
+    /// `None` draws them Sharp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values_anti_alias: Option<crate::text::TypeAntiAlias>,
+    /// The anti-aliasing method the category labels keep once set. `None` draws them Sharp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub categories_anti_alias: Option<crate::text::TypeAntiAlias>,
+    /// The anti-aliasing method the legend labels keep once set. `None` draws them Sharp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legend_anti_alias: Option<crate::text::TypeAntiAlias>,
 }
 
 impl LabelStyles {
@@ -195,6 +213,57 @@ macro_rules! ids {
 }
 ids!(PiePosition { Even => "even", Ratio => "ratio", Stacked => "stacked" });
 ids!(PieSort { None => "none", All => "all", First => "first" });
+
+/// Object › Graph › Column › Column Type: how a column design fills a column or bar. Vertically Scaled stretches it
+/// along the value axis to the column's length at the column's width; Uniformly Scaled scales it both ways to that
+/// length, centered on the column; Repeating stacks copies that each stand for [`ColumnDesign::each`]; Sliding scales the
+/// part above its guide line (in a bar, right of it) in proportion to the column's width and stretches the rest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ColumnType {
+    #[default]
+    Vertical,
+    Uniform,
+    Repeating,
+    Sliding,
+}
+
+/// Object › Graph › Column › For Fractions: a repeating design's last copy, for the part of a value less than one
+/// design, is cut off (Chop) or scaled down along the value axis (Scale).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Fractions {
+    #[default]
+    Chop,
+    Scale,
+}
+
+ids!(ColumnType { Vertical => "vertical", Uniform => "uniform", Repeating => "repeating", Sliding => "sliding" });
+ids!(Fractions { Chop => "chop", Scale => "scale" });
+
+/// Object › Graph › Column: the graph design a series' columns or bars are drawn with, and how it fills them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ColumnDesign {
+    pub design: String,
+    #[serde(skip_serializing_if = "ColumnType::is_default")]
+    pub column_type: ColumnType,
+    /// Repeating: the value one copy of the design stands for (Each Design Represents).
+    pub each: f64,
+    #[serde(skip_serializing_if = "Fractions::is_default")]
+    pub fractions: Fractions,
+}
+
+impl ColumnDesign {
+    /// Each Design Represents for a new column design.
+    pub const EACH: f64 = 10.0;
+}
+
+impl Default for ColumnDesign {
+    fn default() -> Self {
+        Self { design: String::new(), column_type: ColumnType::Vertical, each: Self::EACH, fractions: Fractions::Chop }
+    }
+}
 
 /// Graph Type › Value Axis: which side of the plot the value axis is drawn on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +332,27 @@ pub struct SeriesPaint {
     /// Stroke weight in points, kept with [`Self::stroke`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stroke_width: Option<f64>,
+    /// Opacity (0..1) of the topmost fill of each path directly in the series group (graph designs keep their own),
+    /// taken from the topmost fill row edited on one of them. Absent: fully opaque.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_opacity: Option<f32>,
+    /// Opacity (0..1) of the topmost stroke of each path directly in the series group, as [`Self::fill_opacity`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stroke_opacity: Option<f32>,
+    /// Blend mode of the topmost fill of each path directly in the series group, as [`Self::fill_opacity`]. Absent: Normal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_blend: Option<vectorcraft_color::BlendMode>,
+    /// Blend mode of the topmost stroke of each path directly in the series group, as [`Self::fill_opacity`]. Absent:
+    /// Normal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stroke_blend: Option<vectorcraft_color::BlendMode>,
+    /// Object opacity (0..1) of each path directly in the series group, taken from the object opacity set on one of them.
+    /// Absent: fully opaque.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f32>,
+    /// Object blend mode of each path directly in the series group, as [`Self::opacity`]. Absent: Normal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blend: Option<vectorcraft_color::BlendMode>,
 }
 
 /// Graph data and options. `rows` are categories (one per row of the Graph Data window), each
@@ -345,6 +435,11 @@ pub struct GraphSpec {
     /// series index, for line, scatter and radar series; `None` and missing entries draw the default square.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub series_markers: Vec<Option<String>>,
+    /// Object › Graph › Column: the graph design each series' columns or bars (and legend swatch) are drawn with, by
+    /// series index, for column, stacked column, bar and stacked bar series; `None` and missing entries draw plain
+    /// columns.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub series_columns: Vec<Option<ColumnDesign>>,
     /// Graph Type › Tick Marks for the value axis (the left one, or the bottom one of bar graphs) and the right one:
     /// length, and tick marks per division (0 and 1 = one, at the labels).
     #[serde(skip_serializing_if = "TickLength::is_short")]
@@ -422,6 +517,39 @@ impl GraphSpec {
             cells.iter().enumerate().flat_map(|(c, r)| r.iter().enumerate().filter(|(_, v)| v.is_none()).map(move |(s, _)| [c, s])).collect();
         self.rows = cells.into_iter().map(|r| r.into_iter().map(|v| v.unwrap_or(0.0)).collect()).collect();
     }
+
+    /// CSV of this graph's data (header row with series names, then category + values), as Graph
+    /// Data and `graph.setData` use. Always writes a header so a blank first category isn't
+    /// misread as one.
+    pub fn to_csv(&self) -> String {
+        let cells = self.cells();
+        let width = cells.iter().map(Vec::len).max().unwrap_or(0).max(self.series.len());
+        let mut out = String::from(",");
+        // Quote a label holding a separator, quote or line break (inner quotes doubled), or one with
+        // surrounding spaces; `always` also quotes blank and numeric labels so they stay labels.
+        let field = |c: &str, always: bool| {
+            let special = c.contains([',', '\t', '"', '\n', '\r']) || c != c.trim();
+            if special || (always && (c.trim().is_empty() || c.trim().parse::<f64>().is_ok())) {
+                format!("\"{}\"", c.replace('"', "\"\""))
+            } else {
+                c.to_string()
+            }
+        };
+        out.push_str(&(0..width).map(|s| field(self.series.get(s).map(String::as_str).unwrap_or_default(), false)).collect::<Vec<_>>().join(","));
+        out.push('\n');
+        let labelled = !self.categories.is_empty();
+        for (i, r) in cells.iter().enumerate() {
+            if labelled {
+                out.push_str(&field(self.categories.get(i).map(String::as_str).unwrap_or_default(), true));
+                out.push(',');
+            }
+            let line = r.iter().map(|v| v.map(|v| v.to_string()).unwrap_or_default()).collect::<Vec<_>>().join(",");
+            // A lone blank value would be an empty line, which readers skip; a quoted empty field keeps the row.
+            out.push_str(if line.is_empty() && !labelled { "\"\"" } else { &line });
+            out.push('\n');
+        }
+        out
+    }
 }
 
 impl Default for GraphSpec {
@@ -448,6 +576,7 @@ impl Default for GraphSpec {
             right_axis_min: None,
             right_axis_max: None,
             series_markers: vec![],
+            series_columns: vec![],
             label_styles: LabelStyles::default(),
             first_row_in_front: false,
             first_column_in_front: false,

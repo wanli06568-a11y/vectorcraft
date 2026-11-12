@@ -2,6 +2,7 @@
 
 use kurbo::Vec2;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use vectorcraft_geom::Point;
 
 /// One cubic Bézier segment: start, two handles, end.
@@ -49,6 +50,41 @@ pub(crate) fn resample_closed(p: &[Point], step: f64) -> Option<(Vec<Point>, f64
         let (a, b) = (*p.get(j % n)?, *p.get((j + 1) % n)?);
         out.push(a + (b - a) * t);
     }
+    Some((out, total / m as f64))
+}
+
+/// An open polyline resampled at (about) `step` spacing, both ends kept; also returns the exact
+/// spacing used.
+pub(crate) fn resample_open(p: &[Point], step: f64) -> Option<(Vec<Point>, f64)> {
+    let n = p.len();
+    let (first, last) = (*p.first()?, *p.last()?);
+    if n < 2 || step.is_nan() || step <= 0.0 || !p.iter().all(|&q| finite(q)) {
+        return None;
+    }
+    let mut cum = Vec::with_capacity(n);
+    cum.push(0.0);
+    for pair in p.windows(2) {
+        cum.push(cum.last().copied().unwrap_or(0.0) + pair[0].distance(pair[1]));
+    }
+    let total = cum.last().copied().unwrap_or(0.0);
+    if total.is_nan() || total <= 0.0 {
+        return None;
+    }
+    let m = ((total / step).round() as usize).clamp(1, MAX_POINTS);
+    let mut out = Vec::with_capacity(m + 1);
+    out.push(first);
+    let mut j = 0usize;
+    for i in 1..m {
+        let s = total * i as f64 / m as f64;
+        while cum.get(j + 1).is_some_and(|&c| c < s) {
+            j += 1;
+        }
+        let (c0, c1) = (*cum.get(j)?, *cum.get(j + 1)?);
+        let t = if c1 > c0 { (s - c0) / (c1 - c0) } else { 0.0 };
+        let (a, b) = (*p.get(j)?, *p.get(j + 1)?);
+        out.push(a + (b - a) * t);
+    }
+    out.push(last);
     Some((out, total / m as f64))
 }
 
@@ -280,13 +316,39 @@ pub(crate) fn sample_cubics(cs: &[Cubic], spacing: f64) -> Vec<Point> {
     out
 }
 
+/// Multiply-and-rotate hasher for the small integer cell keys of [`all_within`]. The grid is only ever looked up, never
+/// iterated, so the hash cannot change a result; std's SipHash took about a quarter of the time of a noisy trace.
+#[derive(Default)]
+struct CellHasher(u64);
+
+impl CellHasher {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl Hasher for CellHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        bytes.iter().for_each(|&b| self.add(u64::from(b)));
+    }
+
+    fn write_i64(&mut self, word: i64) {
+        self.add(word as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        // The table picks its bucket from the low bits, which a product leaves weak: bring the strong high bits down.
+        self.0.rotate_left(26)
+    }
+}
+
 /// True when every point of `a` has a point of `b` within `lim`.
 pub(crate) fn all_within(a: &[Point], b: &[Point], lim: f64) -> bool {
     if lim.is_nan() || lim <= 0.0 {
         return false;
     }
     let key = |p: Point| ((p.x / lim).floor() as i64, (p.y / lim).floor() as i64);
-    let mut grid: HashMap<(i64, i64), Vec<Point>> = HashMap::new();
+    let mut grid: HashMap<(i64, i64), Vec<Point>, BuildHasherDefault<CellHasher>> = HashMap::default();
     for &q in b {
         grid.entry(key(q)).or_default().push(q);
     }
@@ -390,5 +452,41 @@ mod tests {
         assert!(all_within(&a, &b, 0.5));
         assert!(!all_within(&a, &b, 0.1));
         assert!(!all_within(&a, &b, 0.0));
+    }
+
+    #[test]
+    fn within_agrees_with_a_brute_force_search() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for round in 0..60 {
+            // Negative and large coordinates, clustered and sparse clouds.
+            let spread = [3.0, 40.0, 1.0e5][round % 3];
+            let cloud = |n: usize, rand: &mut dyn FnMut() -> f64| -> Vec<Point> {
+                (0..n).map(|_| Point::new((rand() - 0.5) * spread, (rand() - 0.5) * spread)).collect()
+            };
+            let a = cloud(1 + round % 7, &mut rand);
+            let mut b = cloud(200, &mut rand);
+            b.extend(a.iter().map(|p| Point::new(p.x + (rand() - 0.5) * 0.3, p.y + (rand() - 0.5) * 0.3)));
+            for lim in [0.05, 0.2, 1.5, 30.0] {
+                let brute = a.iter().all(|&p| b.iter().any(|q| q.distance(p) <= lim));
+                assert_eq!(all_within(&a, &b, lim), brute, "round {round}, lim {lim}");
+                assert_eq!(all_within(&b, &a, lim), b.iter().all(|&p| a.iter().any(|q| q.distance(p) <= lim)), "round {round}, lim {lim}");
+            }
+        }
+    }
+
+    #[test]
+    fn cell_hasher_spreads_keys_whose_low_bits_are_zero() {
+        use std::hash::BuildHasher;
+        // Cell indices that are all multiples of 1024 (pixel-exact points with a power-of-two limit).
+        let build = BuildHasherDefault::<CellHasher>::default();
+        let buckets: std::collections::HashSet<u64> =
+            (0..64i64).flat_map(|i| (0..64i64).map(move |j| (i << 10, j << 10))).map(|k| build.hash_one(k) & 1023).collect();
+        assert!(buckets.len() > 600, "{} of 1024 buckets used", buckets.len());
     }
 }

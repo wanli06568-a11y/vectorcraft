@@ -1,10 +1,11 @@
 //! Selection state (objects and, for direct selection, anchors and segments; ruler guides).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Document, NodeId};
+use crate::{Document, NodeId, NodeKind};
 
 /// (subpath index, anchor index) inside a path.
 pub type AnchorRef = (usize, usize);
@@ -38,11 +39,35 @@ pub struct Selection {
     /// clears them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slices: Vec<NodeId>,
-    /// Ruler guides selected with a selection tool, as indexes into [`Document::guides`]. A new
+    /// Ruler guides selected with a selection tool, by node id ([`Document::ruler_guides`]). A new
     /// selection ([`Self::set`]) clears them; Shift-adding or -removing objects keeps them, so
     /// guides and objects can be selected together, in either order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub guides: Vec<usize>,
+    pub guides: Vec<NodeId>,
+    /// A selected ruler guide that is the key object for Align instead of [`Self::key`] (one of
+    /// [`Self::guides`]): the objects line up on it. Never set with `key`; [`Self::prune`] clears
+    /// it when no object is selected to align to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_guide: Option<NodeId>,
+    /// The new art on a locked artboard that this selection keeps editable
+    /// ([`Document::new_art`]). Undo, Redo and a failed batch restore it with the selection, and
+    /// the engine then sets the document's from it. Editing state, never saved.
+    #[serde(skip)]
+    pub new_art: Arc<HashSet<NodeId>>,
+    /// An object of a dynamic symbol instance's art, selected with Direct Selection: the instance
+    /// is the one selected object, and solid fill and stroke changes go to its own appearance for
+    /// that object ([`crate::symbol_overrides`]). Any other selection change clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_part: Option<SymbolPart>,
+}
+
+/// See [`Selection::symbol_part`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolPart {
+    /// The symbol instance.
+    pub instance: NodeId,
+    /// The object in the symbol's art, as [`crate::symbol_overrides::part`] names it.
+    pub path: Vec<u32>,
 }
 
 impl Selection {
@@ -67,6 +92,18 @@ impl Selection {
         self.target = None;
         self.slices.clear();
         self.guides.clear();
+        self.key_guide = None;
+        self.symbol_part = None;
+    }
+    /// Select only instance `instance`, with the object at `path` of its symbol's art (see
+    /// [`Selection::symbol_part`]).
+    pub fn set_symbol_part(&mut self, instance: NodeId, path: Vec<u32>) {
+        self.set([instance]);
+        self.symbol_part = Some(SymbolPart { instance, path });
+    }
+    /// Is there a key for Align: an object or a guide?
+    pub fn has_key(&self) -> bool {
+        self.key.is_some() || self.key_guide.is_some()
     }
     pub fn set(&mut self, ids: impl IntoIterator<Item = NodeId>) {
         self.clear();
@@ -77,6 +114,7 @@ impl Selection {
     pub fn add(&mut self, id: NodeId) {
         self.target = None;
         self.slices.clear();
+        self.symbol_part = None;
         if !self.objects.contains(&id) {
             self.objects.push(id);
         }
@@ -84,6 +122,7 @@ impl Selection {
     pub fn remove(&mut self, id: NodeId) {
         self.target = None;
         self.slices.clear();
+        self.symbol_part = None;
         self.objects.retain(|x| *x != id);
         self.anchors.remove(&id);
         self.segments.remove(&id);
@@ -100,10 +139,10 @@ impl Selection {
             }
         }
     }
-    /// Select ruler guides `indexes` (see [`Selection::guides`]) and nothing else.
-    pub fn set_guides(&mut self, indexes: impl IntoIterator<Item = usize>) {
+    /// Select ruler guides `ids` (see [`Selection::guides`]) and nothing else.
+    pub fn set_guides(&mut self, ids: impl IntoIterator<Item = NodeId>) {
         self.clear();
-        for i in indexes {
+        for i in ids {
             if !self.guides.contains(&i) {
                 self.guides.push(i);
             }
@@ -111,9 +150,13 @@ impl Selection {
     }
     /// Add ruler guide `i` to the selection, or take it out, keeping the selected objects (a
     /// Shift-click on a guide).
-    pub fn toggle_guide(&mut self, i: usize) {
+    pub fn toggle_guide(&mut self, i: NodeId) {
+        self.symbol_part = None;
         if let Some(k) = self.guides.iter().position(|g| *g == i) {
             self.guides.remove(k);
+            if self.key_guide == Some(i) {
+                self.key_guide = None;
+            }
         } else {
             self.guides.push(i);
         }
@@ -125,6 +168,29 @@ impl Selection {
     pub fn partial(&self, id: NodeId) -> Option<&BTreeSet<AnchorRef>> {
         self.anchors.get(&id)
     }
+    /// The objects selected whole: those with no direct-selected anchors.
+    pub fn whole(&self) -> Vec<NodeId> {
+        self.objects.iter().copied().filter(|id| !self.anchors.contains_key(id)).collect()
+    }
+    /// With direct-selected anchors, what a transform of them measures from: the box around those
+    /// anchors and the objects selected whole (`visual`: with their strokes). `None` without any.
+    pub fn anchor_bounds(&self, doc: &Document, visual: bool) -> Option<vectorcraft_geom::Rect> {
+        if self.anchors.is_empty() {
+            return None;
+        }
+        vectorcraft_geom::union_opt(doc.bounds_of(&self.whole(), visual), self.anchors_box(doc))
+    }
+    /// The box around the anchors selected with Direct Selection. `None` without any.
+    pub fn anchors_box(&self, doc: &Document) -> Option<vectorcraft_geom::Rect> {
+        let mut acc = None;
+        for (id, set) in &self.anchors {
+            let Some(NodeKind::Path { path, .. }) = doc.node(*id).map(|n| &n.kind) else { continue };
+            for a in set.iter().filter_map(|&(si, ai)| path.subpaths.get(si)?.anchors.get(ai)) {
+                acc = vectorcraft_geom::union_opt(acc, Some(vectorcraft_geom::Rect::from_points(a.p, a.p)));
+            }
+        }
+        acc
+    }
     /// Which direction handles belong to selected segments; both for an anchor selection.
     pub fn handle_sides(&self, id: NodeId, si: usize, ai: usize, sp: &vectorcraft_geom::SubPath) -> (bool, bool) {
         let Some(segments) = self.segments.get(&id) else { return (true, true) };
@@ -135,7 +201,9 @@ impl Selection {
     pub fn prune(&mut self, doc: &Document) {
         // Every id this looks up, found in one walk of the tree.
         let ids = self.objects.iter().chain(self.anchors.keys()).chain(self.segments.keys()).copied().chain(self.key).chain(self.target);
-        let found = doc.index_paths(ids);
+        let mut found = doc.index_paths(ids);
+        // A ruler guide is selected in `guides` only, never as an object, an anchor or the key.
+        found.retain(|_, p| !doc.node_at(p).is_some_and(|n| n.is_ruler_guide()));
         self.objects.retain(|id| found.contains_key(id));
         self.anchors.retain(|id, _| found.contains_key(id));
         self.segments.retain(|id, refs| {
@@ -143,13 +211,20 @@ impl Selection {
             refs.retain(|&(si, seg)| path.subpaths.get(si).is_some_and(|sp| seg < sp.segment_count()));
             !refs.is_empty() && self.objects.contains(id) && self.anchors.contains_key(id)
         });
-        // The key object stays while another selected object lies outside it.
+        // Guides that are gone, or hidden or locked (themselves or by their layer), can't stay
+        // selected.
+        if !self.guides.is_empty() {
+            let editable = doc.editable();
+            self.guides.retain(|id| doc.node(*id).is_some_and(|n| n.is_ruler_guide()) && editable(*id));
+        }
+        // The key object stays while another selected object lies outside it, or while ruler
+        // guides are selected for it to line up (#2143).
         let keep = self.key.and_then(|k| found.get(&k)).and_then(|p| doc.node_at(p)).is_some_and(|n| {
             let mut inside = BTreeSet::new();
             n.walk(&mut |c| {
                 inside.insert(c.id);
             });
-            self.objects.iter().any(|o| !inside.contains(o))
+            self.objects.iter().any(|o| !inside.contains(o)) || (self.objects.contains(&n.id) && !self.guides.is_empty())
         });
         if !keep {
             self.key = None;
@@ -158,16 +233,70 @@ impl Selection {
             self.target = None;
         }
         self.slices.retain(|id| doc.is_slice(*id));
-        // Guides on a hidden or locked layer can't stay selected.
-        self.guides.retain(|i| doc.guides.get(*i).is_some_and(|g| doc.guide_editable(g)));
+        // A key guide needs objects to line up on it, and stays selected.
+        if self.key.is_some() || self.objects.is_empty() || self.key_guide.is_some_and(|k| !self.guides.contains(&k)) {
+            self.key_guide = None;
+        }
+        // A selected part needs its instance selected alone, with no guides, its symbol dynamic
+        // and the object still in the symbol's art as a path, compound path or type, where neither
+        // it nor a group or layer around it is hidden, locked or a template.
+        let editable_part = |art: &crate::Node, path: &[u32]| {
+            crate::symbol_overrides::part(art, path).is_some_and(crate::symbol_overrides::takes_part_paint)
+                && (0..=path.len())
+                    .all(|k| crate::symbol_overrides::part(art, &path[..k]).is_some_and(|n| n.visible && !n.locked && !n.is_template()))
+        };
+        let part_kept = self.symbol_part.as_ref().is_some_and(|sp| {
+            self.objects == [sp.instance]
+                && self.guides.is_empty()
+                && found.get(&sp.instance).and_then(|p| doc.node_at(p)).is_some_and(|n| match &n.kind {
+                    NodeKind::SymbolInstance { symbol, .. } => {
+                        doc.symbols.iter().find(|s| s.name == *symbol).is_some_and(|s| s.dynamic && editable_part(&s.art, &sp.path))
+                    }
+                    _ => false,
+                })
+        });
+        if !part_kept {
+            self.symbol_part = None;
+        }
     }
     /// Deselect the objects that are hidden or locked, themselves or through a group or layer
     /// around them (and so the key object when it is one): hidden or locked art can't stay
     /// selected.
     pub fn deselect_uneditable(&mut self, doc: &Document) {
-        let out: Vec<NodeId> = self.objects.iter().copied().filter(|o| !doc.is_editable(*o)).collect();
-        for o in out {
-            self.remove(o);
+        let locks = doc.locked_artboards();
+        let uneditable: HashSet<NodeId> = self.objects.iter().copied().filter(|o| !doc.is_editable_with(&locks, *o)).collect();
+        self.deselect_all(&uneditable);
+    }
+    /// Deselect the objects on a locked artboard ([`crate::LockedArtboards::holds_id`]), whatever
+    /// selected them or moved them there (and so the key object when it is one): they act as
+    /// locked art. A targeted layer stays targeted, as it does with locked objects in it.
+    pub fn deselect_on_locked_artboards(&mut self, doc: &Document) {
+        let locks = doc.locked_artboards();
+        if locks.is_empty() {
+            return;
+        }
+        let locked: HashSet<NodeId> = self.objects.iter().copied().filter(|o| locks.holds_id(*o)).collect();
+        let layer = self.target.filter(|t| doc.node(*t).is_some_and(crate::Node::is_layer));
+        self.deselect_all(&locked);
+        if layer.is_some() {
+            self.target = layer;
+        }
+    }
+    /// Deselect the objects `gone` in one pass, with their anchors, segments and key.
+    fn deselect_all(&mut self, gone: &HashSet<NodeId>) {
+        if gone.is_empty() {
+            return;
+        }
+        self.target = None;
+        self.slices.clear();
+        if self.symbol_part.as_ref().is_some_and(|sp| gone.contains(&sp.instance)) {
+            self.symbol_part = None;
+        }
+        self.objects.retain(|o| !gone.contains(o));
+        self.anchors.retain(|id, _| !gone.contains(id));
+        self.segments.retain(|id, _| !gone.contains(id));
+        if self.key.is_some_and(|k| gone.contains(&k)) {
+            self.key = None;
         }
     }
     /// Target `id` (see [`Selection::target`]): a layer gets its visible, unlocked art selected
@@ -180,12 +309,16 @@ impl Selection {
         self.target = Some(id);
     }
     /// Shift-clicking `id`'s target circle: it (a layer: its art) joins the selection, or leaves it
-    /// when it is all selected already. Several objects are then selected, none targeted.
+    /// when it is all selected already. Several objects are then selected, none targeted. Art on a
+    /// locked artboard is neither counted nor added, since
+    /// [`Selection::deselect_on_locked_artboards`] deselects it.
     pub fn toggle_target(&mut self, doc: &Document, id: NodeId) {
-        let ids = match doc.node(id) {
+        let mut ids = match doc.node(id) {
             Some(n) if n.is_layer() => n.layer_art(true),
             _ => vec![id],
         };
+        let locks = doc.locked_artboards();
+        ids.retain(|i| !locks.holds_id(*i));
         if ids.iter().all(|i| self.contains(*i)) {
             ids.iter().for_each(|i| self.remove(*i));
         } else {
@@ -208,134 +341,4 @@ impl Selection {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn basic_ops() {
-        let mut s = Selection::default();
-        s.add(NodeId(1));
-        s.add(NodeId(1));
-        s.toggle(NodeId(2));
-        assert_eq!(s.objects, vec![NodeId(1), NodeId(2)]);
-        s.toggle(NodeId(1));
-        assert_eq!(s.objects, vec![NodeId(2)]);
-        s.clear();
-        assert!(s.is_empty());
-    }
-
-    #[test]
-    fn guides_are_selected_on_their_own() {
-        let mut s = Selection::default();
-        s.add(NodeId(1));
-        s.set_guides([2, 0, 2]);
-        assert_eq!((s.objects.clone(), s.guides.clone()), (vec![], vec![2, 0]));
-        assert!(s.has_objects_or_guides() && s.is_empty());
-        // Shift-adding an object keeps them; a new selection doesn't.
-        s.add(NodeId(1));
-        assert_eq!(s.guides, vec![2, 0]);
-        s.set([NodeId(1)]);
-        assert!(s.guides.is_empty());
-        // Toggled, a guide joins (or leaves) the selected objects.
-        s.toggle_guide(0);
-        assert_eq!((s.objects.clone(), s.guides.clone()), (vec![NodeId(1)], vec![0]));
-        s.toggle_guide(0);
-        assert_eq!((s.objects.clone(), s.guides.clone()), (vec![NodeId(1)], vec![]));
-        // Pruning drops guides the document no longer has.
-        let mut d = Document::new(100.0, 100.0);
-        d.guides.push(crate::Guide::new(true, 10.0));
-        s.set_guides([0, 1]);
-        s.prune(&d);
-        assert_eq!(s.guides, vec![0]);
-    }
-
-    #[test]
-    fn guides_show_and_lock_with_their_layer() {
-        let mut d = Document::new(100.0, 100.0);
-        let layer = d.layers[0].id;
-        let g = crate::Guide { layer: Some(layer), ..crate::Guide::new(true, 10.0) };
-        assert!(d.guide_shown(&g) && d.guide_editable(&g));
-        d.node_mut(layer).unwrap().locked = true;
-        assert!(d.guide_shown(&g) && !d.guide_editable(&g), "locked: shown, not editable");
-        d.node_mut(layer).unwrap().visible = false;
-        assert!(!d.guide_shown(&g) && !d.guide_editable(&g), "hidden");
-        // On no layer, or a layer that's gone: always there.
-        assert!(d.guide_shown(&crate::Guide::new(false, 5.0)));
-        let gone = crate::Guide { layer: Some(NodeId(9999)), ..crate::Guide::new(true, 1.0) };
-        assert!(d.guide_shown(&gone) && d.guide_editable(&gone));
-        d.guides.push(g);
-        assert_eq!(d.guides_on(layer).count(), 1);
-        // Guides on no layer, or a gone one, are adopted by the top visible, unlocked layer.
-        d.node_mut(layer).unwrap().visible = true;
-        d.node_mut(layer).unwrap().locked = false;
-        d.guides.push(crate::Guide::new(false, 5.0));
-        d.guides.push(gone);
-        assert_eq!(d.adopt_guides(), 2);
-        assert!(d.guides.iter().all(|g| g.layer == Some(layer)));
-        assert_eq!(d.adopt_guides(), 0, "once");
-        // A guide saved before guides had layers reads as one on no layer.
-        let old: crate::Guide = serde_json::from_str(r#"{"vertical": true, "pos": 5.0}"#).unwrap();
-        assert_eq!(old.layer, None);
-        assert!(!serde_json::to_string(&crate::Guide::new(true, 5.0)).unwrap().contains("layer"), "nothing new written");
-    }
-
-    #[test]
-    fn selection_changes_clear_the_target() {
-        let mut s = Selection::default();
-        s.set([NodeId(2), NodeId(3)]);
-        s.target = Some(NodeId(1));
-        assert_eq!(s.subjects(), &[NodeId(1)]);
-        s.add(NodeId(4));
-        assert_eq!(s.target, None);
-        assert_eq!(s.subjects(), &[NodeId(2), NodeId(3), NodeId(4)]);
-        s.target = Some(NodeId(1));
-        s.remove(NodeId(2));
-        assert_eq!(s.target, None);
-        s.target = Some(NodeId(1));
-        s.set([NodeId(3)]);
-        assert_eq!(s.target, None);
-    }
-
-    #[test]
-    fn a_key_object_needs_two_or_more_selected_objects() {
-        let mut s = Selection::default();
-        s.set([NodeId(1), NodeId(2)]);
-        s.key = Some(NodeId(2));
-        s.remove(NodeId(1));
-        assert_eq!(s.key, Some(NodeId(2)), "another object left: remove keeps the key");
-        s.remove(NodeId(2));
-        assert_eq!(s.key, None, "the key object itself left");
-        // Pruning drops objects the document no longer has and clears the key once no other
-        // selected object lies outside it.
-        let mut d = Document::new(100.0, 100.0);
-        let layer = d.layers[0].id;
-        let mut ids = vec![];
-        for _ in 0..4 {
-            let id = d.alloc_id();
-            ids.push(d.insert(Some(layer), usize::MAX, crate::Node::group(id, vec![])).unwrap());
-        }
-        s.set(ids.iter().copied());
-        s.key = Some(ids[3]);
-        d.remove(ids[0]).unwrap();
-        s.prune(&d);
-        assert_eq!(s.key, Some(ids[3]), "three objects left: the key stays");
-        s.toggle(ids[1]);
-        s.prune(&d);
-        assert_eq!(s.key, Some(ids[3]), "two objects left: the key stays");
-        s.toggle(ids[2]);
-        s.prune(&d);
-        assert_eq!((s.objects.clone(), s.key), (vec![ids[3]], None), "one object left");
-        // A group key selected with only its own member is cleared too; another selected object
-        // outside the group keeps it.
-        let member = d.alloc_id();
-        d.insert(Some(ids[3]), usize::MAX, crate::Node::group(member, vec![])).unwrap();
-        s.set([member, ids[3]]);
-        s.key = Some(ids[3]);
-        s.prune(&d);
-        assert_eq!(s.key, None, "a group and its own member");
-        s.set([member, ids[3], ids[2]]);
-        s.key = Some(ids[3]);
-        s.prune(&d);
-        assert_eq!(s.key, Some(ids[3]), "another object outside the group");
-    }
-}
+mod tests;
