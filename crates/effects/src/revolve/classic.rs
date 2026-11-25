@@ -4,6 +4,8 @@
 use serde_json::Value;
 use vectorcraft_three_d::Revolve;
 
+use crate::solids::graphics::map_art;
+
 pub const CLASSIC_REVOLVE: &str = "threeD.classicRevolve";
 
 /// The numeric parameters: (key, lowest, highest, whole numbers only).
@@ -23,19 +25,28 @@ const RANGES: [(&str, f64, f64, bool); 13] = [
     ("blendSteps", 1.0, 256.0, true),
 ];
 
-const FLAGS: [&str; 2] = ["cap", "lightBehind"];
+const FLAGS: [&str; 5] = ["cap", "lightBehind", "preserveSpotColors", map_art::MAP_SHADE, map_art::MAP_INVISIBLE];
 
 /// The surface Revolve (Classic)'s parameters `p` sweep: Revolve's angle, cap, offset, edge,
-/// rotation and perspective, built unshaded, since the classic surfaces light its faces.
+/// rotation and perspective, built unshaded, since the classic surfaces light its faces. With
+/// mapped art its side is laid out for it.
 pub(crate) fn options(p: &Value) -> Revolve {
-    Revolve { shade: false, smooth_shading: false, lights: None, light_color: [1.0; 3], ..super::revolve_options(p) }
+    Revolve {
+        shade: false,
+        smooth_shading: false,
+        lights: None,
+        light_color: [1.0; 3],
+        map_surface: !map_art::surface_maps(p).is_empty(),
+        ..super::revolve_options(p)
+    }
 }
 
 /// Check Revolve (Classic)'s parameters `p` (its defaults filled in) beyond the checks it shares
 /// with Revolve: every key is one of its parameters, numbers are in range, flags are true or false,
-/// and the surface and shading color are named.
+/// the surface and shading color are named, and `mapArt` holds valid maps.
 pub(crate) fn validate(p: &Value) -> Result<(), String> {
-    crate::solids::classic::validate_classic(CLASSIC_REVOLVE, p, &RANGES, &FLAGS)
+    crate::solids::classic::validate_classic(CLASSIC_REVOLVE, p, &RANGES, &FLAGS)?;
+    map_art::validate(CLASSIC_REVOLVE, p)
 }
 
 #[cfg(test)]
@@ -118,6 +129,87 @@ mod tests {
         }
     }
 
+    /// With Preserve Spot Colors, a fill linked to a spot swatch stays linked on every face: the
+    /// highlight lowers its tint, and the shadow is black multiplied and overprinting over it.
+    #[test]
+    fn preserve_spot_colors_keeps_the_swatch_on_every_face() {
+        let ink = Color::cmyk(0.0, 1.0, 0.0, 0.2);
+        let spot = |params: Value| {
+            let mut n = profile();
+            *n.appearance = Appearance::basic(Paint::Solid { color: ink, swatch: Some("Ink".into()), tint: 0.5 }, Paint::None, 0.0);
+            n.appearance.effects.push(crate::new_effect(CLASSIC_REVOLVE, &params).unwrap());
+            crate::revolve_art(&n).unwrap()
+        };
+        let art = spot(json!({"preserveSpotColors": true}));
+        let mut darkened = 0;
+        for face in faces(&art) {
+            let mut fills = face.appearance.items.iter().filter_map(|i| match i {
+                AppearanceItem::Fill(f) => Some(f),
+                AppearanceItem::Stroke(_) => None,
+            });
+            match fills.next().map(|f| &f.paint) {
+                Some(Paint::Solid { color, swatch: Some(name), tint }) => {
+                    assert_eq!(name, "Ink");
+                    assert!(*tint > 0.0 && *tint <= 0.5, "{tint}");
+                    assert_eq!(*color, ink.tinted(*tint / 0.5), "the color is the swatch at the face's tint");
+                }
+                other => panic!("the face keeps its swatch: {other:?}"),
+            }
+            if let Some(shadow) = fills.next() {
+                assert!(matches!(shadow.paint.color(), Some(Color::Gray { .. })), "{:?}", shadow.paint);
+                assert_eq!((shadow.blend, shadow.overprint), (vectorcraft_doc::color::BlendMode::Multiply, true));
+                darkened += 1;
+            }
+        }
+        assert!(darkened > 0, "faces turned from the light are darkened");
+        // Off, and with a custom shading color, the faces are process mixes again.
+        for params in [json!({}), json!({"preserveSpotColors": true, "shadingColor": "custom", "shadingCustom": "#336699"})] {
+            let art = spot(params.clone());
+            let linked = faces(&art)
+                .iter()
+                .filter(|f| {
+                    f.appearance.items.iter().any(|i| matches!(i, AppearanceItem::Fill(f) if matches!(f.paint, Paint::Solid { swatch: Some(_), .. })))
+                })
+                .count();
+            assert!(linked < faces(&art).len(), "{params}: shaded faces lose the swatch");
+        }
+    }
+
+    /// With Black Overprint every face keeps the blue, and the faces that darken get black over it,
+    /// overprinting, as strong as the darkening of the shading color Black.
+    #[test]
+    fn black_overprint_keeps_the_blue_under_overprinting_black() {
+        let darkened = revolved(json!({"surface": "diffuse"}));
+        let art = revolved(json!({"surface": "diffuse", "shadingColor": "blackOverprint"}));
+        let (darkened, drawn) = (faces(&darkened), faces(&art));
+        assert_eq!(darkened.len(), drawn.len());
+        let mut shaded = 0;
+        for (face, black) in drawn.iter().zip(&darkened) {
+            let fills: Vec<&vectorcraft_doc::FillLayer> = face
+                .appearance
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    AppearanceItem::Fill(f) => Some(f),
+                    AppearanceItem::Stroke(_) => None,
+                })
+                .collect();
+            assert_eq!((fills[0].paint.color(), fills[0].overprint), (Some(BLUE), false));
+            let k = match fills.get(1) {
+                Some(shadow) => {
+                    let Some(Color::Gray { k }) = shadow.paint.color() else { panic!("black shading: {:?}", shadow.paint) };
+                    assert_eq!((shadow.blend, shadow.overprint), (vectorcraft_doc::color::BlendMode::Multiply, true));
+                    shaded += 1;
+                    k
+                }
+                None => 0.0,
+            };
+            let b = fill(black).unwrap().to_rgb()[2];
+            assert!((b - 0.8 * (1.0 - k)).abs() < 1e-3, "black at {k} matches the darkened blue {b}");
+        }
+        assert!(shaded > 0, "faces turned from the light get black");
+    }
+
     #[test]
     fn angle_offset_edge_and_cap_shape_the_surface() {
         let full = revolved(json!({"rotationX": 0, "rotationY": 0, "rotationZ": 0})).visual_bounds().unwrap();
@@ -152,6 +244,50 @@ mod tests {
         assert!(colors.iter().any(|c| c[2] > c[0]) && colors.iter().any(|c| c[0] == c[2]), "both members' paints are drawn");
     }
 
+    /// A group member in a gradient with transparent stops keeps the shared back-to-front order of
+    /// every member's faces: its faces go in runs that carry its opacity mask, and the other
+    /// member's faces are drawn between them where they are in front of some and behind others.
+    #[test]
+    fn a_member_in_a_transparent_gradient_keeps_the_shared_face_order() {
+        use vectorcraft_doc::color::{Gradient, GradientKind, GradientPaint, GradientStop};
+        let art = |end_opacity: f32| {
+            let mut end = GradientStop::new(1.0, Color::BLACK);
+            end.opacity = end_opacity;
+            let gradient =
+                Paint::Gradient(Box::new(GradientPaint::new(Gradient::new(GradientKind::Linear, vec![GradientStop::new(0.0, BLUE), end]))));
+            let mut b = BezPath::new();
+            b.move_to((150.0, 60.0));
+            b.line_to((170.0, 60.0));
+            b.line_to((170.0, 140.0));
+            let outer = Node::path(NodeId(2), PathData::from_bezpath(&b), Appearance::basic(gradient, Paint::None, 0.0));
+            let mut g = Node::group(NodeId(3), vec![std::sync::Arc::new(outer), std::sync::Arc::new(profile())]);
+            g.appearance.effects.push(crate::new_effect(CLASSIC_REVOLVE, &json!({})).unwrap());
+            crate::revolve_art(&g).unwrap()
+        };
+        // The drawing order: `M` for a group with an opacity mask, `F` for a face outside one.
+        fn visit(n: &Node, order: &mut String) {
+            if n.extras().mask.is_some() {
+                order.push('M');
+                return;
+            }
+            if n.path_data().is_some() {
+                order.push('F');
+            }
+            for c in n.children().into_iter().flatten() {
+                visit(c, order);
+            }
+        }
+        let order = |art: &Node| {
+            let mut order = String::new();
+            visit(art, &mut order);
+            order
+        };
+        assert!(!order(&art(1.0)).contains('M'), "an opaque gradient needs no mask");
+        let masked = order(&art(0.5));
+        let (first, last) = (masked.find('M').unwrap(), masked.rfind('M').unwrap());
+        assert!(masked.get(first..last).is_some_and(|between| between.contains('F')), "faces between the member's runs: {masked}");
+    }
+
     #[test]
     fn bad_parameters_are_refused() {
         let check = |p: Value| crate::validate_three_d(&profile(), CLASSIC_REVOLVE, &crate::merged_params(CLASSIC_REVOLVE, &p));
@@ -163,6 +299,7 @@ mod tests {
             (json!({"rotationY": -181}), "`rotationY` must be between -180 and 180"),
             (json!({"blendSteps": 2.5}), "`blendSteps` must be a whole number"),
             (json!({"lightBehind": 1}), "`lightBehind` must be true or false"),
+            (json!({"preserveSpotColors": "on"}), "`preserveSpotColors` must be true or false"),
             (json!({"surface": "glossy"}), "`surface` must be one of"),
             (json!({"shadingColor": "white"}), "`shadingColor` must be one of"),
             (json!({"shadingCustom": "red"}), "`shadingCustom` must be a #rrggbb color"),

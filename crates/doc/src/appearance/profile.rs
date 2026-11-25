@@ -130,8 +130,9 @@ impl WidthProfile {
 
 /// Pen pressure recorded along a stroke (the Paintbrush with a graphics tablet): (position 0..1
 /// along the path, pressure 0..1) samples in order, positions measured as a [`WidthProfile`]'s
-/// are. The pen's tilt is kept the same way ([`StrokeLayer::tilt`]). Calligraphic and Scatter
-/// brushes with Pressure or Tilt variation read them; everything else ignores them.
+/// are. The pen's tilt and an airbrush pen's finger wheel are kept the same way
+/// ([`StrokeLayer::tilt`], [`StrokeLayer::wheel`]). Brushes with Pressure, Tilt or Stylus Wheel
+/// variation read them; everything else ignores them.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PressureProfile {
     pub points: Vec<(f64, f64)>,
@@ -200,6 +201,13 @@ impl AngleProfile {
     pub fn at(&self, t: f64) -> f64 {
         let v = interpolated(&self.points, t).unwrap_or(0.0);
         if v.is_finite() { vectorcraft_geom::normalize_deg(v) } else { 0.0 }
+    }
+
+    /// The angle at `t` (0..1) as [`Self::at`] reads it, but in the samples' own running degrees,
+    /// so the whole turns the curve makes along the stroke are kept; 0 without any samples.
+    pub fn unwrapped_at(&self, t: f64) -> f64 {
+        let v = interpolated(&self.points, t).unwrap_or(0.0);
+        if v.is_finite() { v } else { 0.0 }
     }
 
     /// A profile from (position, degrees) samples in order along the stroke: non-finite ones are

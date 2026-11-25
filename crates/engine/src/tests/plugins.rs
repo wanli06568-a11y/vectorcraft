@@ -182,6 +182,136 @@ fn filters_make_guides_and_locked_objects_left_unselected() {
     assert_eq!(st.history.undo.len(), undo + 1);
 }
 
+/// A compound path handed back with its path as it was keeps its members, hidden and locked ones
+/// included. A changed path replaces its members, and is refused while a member is hidden, locked,
+/// a guide or not a path, as is turning it into a plain path.
+#[test]
+fn a_filter_keeps_or_replaces_a_compound_path_s_members_whole() {
+    use std::sync::Arc;
+    use vectorcraft_doc::{Appearance, Node, NodeKind};
+    use vectorcraft_geom::FillRule;
+    let mut s = session();
+    let compound_of = |s: &mut Session, members: Vec<Node>| {
+        let mut id = NodeId(0);
+        s.edit("Set up", |d, _| {
+            let n = Node::new(d.alloc_id(), NodeKind::Compound { children: members.into_iter().map(Arc::new).collect(), rule: FillRule::NonZero });
+            let layer = d.layers[0].id;
+            id = d.insert(Some(layer), usize::MAX, n).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        id
+    };
+    let members = |s: &Session, id: NodeId| match &node(s, id).kind {
+        NodeKind::Compound { children, .. } => children.iter().map(|c| (c.id, c.visible, c.locked, c.path_data().cloned())).collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let new_ids = |s: &mut Session| s.edit("Set up", |d, _| Ok([d.alloc_id(), d.alloc_id(), d.alloc_id(), d.alloc_id()])).unwrap();
+    let [a, b, c, d] = new_ids(&mut s);
+    let [g, h, i, j] = new_ids(&mut s);
+    let hidden = |id: NodeId, x: f64| {
+        let mut n = Node::path(id, square_at(x), Appearance::default());
+        n.visible = false;
+        n
+    };
+    let locked = |id: NodeId, x: f64| {
+        let mut n = Node::path(id, square_at(x), Appearance::default());
+        n.locked = true;
+        n
+    };
+    // A member with an empty subpath, which plug-in output can't hold, still counts as handed back.
+    let empty = Node::path(g, PathData::single(SubPath::polyline(&[], false)), Appearance::default());
+    let kept = compound_of(&mut s, vec![hidden(a, 40.0), locked(b, 80.0), empty]);
+    let plain =
+        compound_of(&mut s, vec![Node::path(c, square_at(120.0), Appearance::default()), Node::path(d, square_at(160.0), Appearance::default())]);
+    let was = members(&s, kept);
+    install_wat(&mut s, &tpl::module(&tpl::manifest("test.engine.compound.echo", "filter", "{}"), tpl::ECHO, "", 1));
+    run(&mut s, "plugin.run", json!({"id": "test.engine.compound.echo", "ids": [kept.0]}));
+    assert_eq!(members(&s, kept), was, "handed back as it was, the members stay as they were");
+    // New geometry for a compound with a hidden or a locked member, or the same geometry as a plain
+    // path, is refused, and the document is left alone.
+    let mut moved = square_at(200.0);
+    moved.subpaths.extend(square_at(240.0).subpaths);
+    let reshape = |id: &str, target: NodeId, extra: Value| {
+        let mut o = json!({"id": target.0, "path": moved.clone()});
+        o.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        tpl::returning(&tpl::manifest(id, "filter", "{}"), &json!({ "objects": [o] }).to_string())
+    };
+    let hidden_only = compound_of(&mut s, vec![hidden(h, 360.0)]);
+    let locked_only = compound_of(&mut s, vec![Node::path(i, square_at(360.0), Appearance::default()), locked(j, 380.0)]);
+    // A member that is itself a compound path, shown and unlocked but holding a hidden member: its
+    // geometry isn't in the input, so a new path or a plain path would drop it.
+    let [k, l, m, _] = new_ids(&mut s);
+    let inner = Node::new(k, NodeKind::Compound { children: vec![Arc::new(hidden(l, 400.0))], rule: FillRule::NonZero });
+    let nested = compound_of(&mut s, vec![Node::path(m, square_at(440.0), Appearance::default()), inner]);
+    let was_nested = node(&s, nested).clone();
+    run(&mut s, "plugin.run", json!({"id": "test.engine.compound.echo", "ids": [nested.0]}));
+    assert_eq!(node(&s, nested).kind, was_nested.kind, "handed back as it was, a nested compound member stays");
+    let flagged = "a hidden, locked or guide member";
+    for (target, why) in [(hidden_only, flagged), (locked_only, flagged), (nested, "a member that isn't a path")] {
+        install_wat(&mut s, &reshape("test.engine.compound.reshape", target, json!({})));
+        let flatten = tpl::returning(
+            &tpl::manifest("test.engine.compound.flatten", "filter", "{}"),
+            &json!({"objects": [{"id": target.0, "type": "path"}]}).to_string(),
+        );
+        install_wat(&mut s, &flatten);
+        let before = (s.doc().unwrap().doc.clone(), s.doc().unwrap().history.undo.len());
+        for id in ["test.engine.compound.reshape", "test.engine.compound.flatten"] {
+            let e = s.execute("plugin.run", &json!({"id": id, "ids": [target.0]})).unwrap_err().to_string();
+            assert!(e.contains(&format!("compound path {} has {why}", target.0)), "{id}: {e}");
+            assert_eq!((s.doc().unwrap().doc.clone(), s.doc().unwrap().history.undo.len()), before, "{id}");
+        }
+    }
+    // Without such members, new geometry replaces the members: one per subpath, in the old members' places.
+    install_wat(&mut s, &reshape("test.engine.compound.reshape", plain, json!({})));
+    run(&mut s, "plugin.run", json!({"id": "test.engine.compound.reshape", "ids": [plain.0]}));
+    let now = members(&s, plain);
+    assert_eq!(now.iter().map(|m| m.3.clone()).collect::<Vec<_>>(), [Some(square_at(200.0)), Some(square_at(240.0))]);
+    assert!(now.iter().all(|m| m.1 && !m.2), "shown and unlocked members: {now:?}");
+    assert_eq!(now.iter().map(|m| m.0).collect::<Vec<_>>(), [c, d], "the members keep their places' ids");
+    // A guide member is refused the same way, unless the output sets `guide` for the whole object.
+    let guide_of = |s: &mut Session| {
+        let [e, f, ..] = new_ids(s);
+        let mut guide_member = Node::path(e, square_at(280.0), Appearance::default());
+        if let NodeKind::Path { guide, .. } = &mut guide_member.kind {
+            *guide = true;
+        }
+        compound_of(s, vec![guide_member, Node::path(f, square_at(320.0), Appearance::default())])
+    };
+    let guides = |s: &Session, id: NodeId| match &node(s, id).kind {
+        NodeKind::Compound { children, .. } => children.iter().map(|c| matches!(c.kind, NodeKind::Path { guide: true, .. })).collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let guide = guide_of(&mut s);
+    install_wat(&mut s, &reshape("test.engine.compound.reshape", guide, json!({})));
+    let err = s.execute("plugin.run", &json!({"id": "test.engine.compound.reshape", "ids": [guide.0]})).unwrap_err().to_string();
+    assert!(err.contains("guide member"), "{err}");
+    let flatten = tpl::returning(
+        &tpl::manifest("test.engine.compound.flatten.unflagged", "filter", "{}"),
+        &json!({"objects": [{"id": guide.0, "type": "path"}]}).to_string(),
+    );
+    install_wat(&mut s, &flatten);
+    let err = s.execute("plugin.run", &json!({"id": "test.engine.compound.flatten.unflagged", "ids": [guide.0]})).unwrap_err().to_string();
+    assert!(err.contains(&format!("compound path {} has {flagged}", guide.0)), "{err}");
+    assert_eq!(guides(&s, guide), [true, false], "a refused flatten leaves the guide member as it was");
+    for (id, on) in [("test.engine.compound.unguide", false), ("test.engine.compound.reguide", true)] {
+        let target = guide_of(&mut s);
+        install_wat(&mut s, &reshape(id, target, json!({ "guide": on })));
+        run(&mut s, "plugin.run", json!({"id": id, "ids": [target.0]}));
+        assert_eq!(members(&s, target).iter().map(|m| m.3.clone()).collect::<Vec<_>>(), [Some(square_at(200.0)), Some(square_at(240.0))], "{id}");
+        assert_eq!(guides(&s, target), [on, on], "{id}: every new member takes the output's `guide`");
+    }
+    // Turning it into a plain path is allowed the same way when the output sets `guide`.
+    let target = guide_of(&mut s);
+    let flatten = tpl::returning(
+        &tpl::manifest("test.engine.compound.flatten.guide", "filter", "{}"),
+        &json!({"objects": [{"id": target.0, "type": "path", "guide": true}]}).to_string(),
+    );
+    install_wat(&mut s, &flatten);
+    run(&mut s, "plugin.run", json!({"id": "test.engine.compound.flatten.guide", "ids": [target.0]}));
+    assert!(matches!(node(&s, target).kind, NodeKind::Path { guide: true, .. }), "{:?}", node(&s, target).kind);
+}
+
 #[test]
 fn failing_plugins_leave_the_document_and_history_alone() {
     let mut s = session();
@@ -235,8 +365,16 @@ fn live_effect_plugins_reshape_editable_art_and_expand() {
     run(&mut s, "select.all", json!({}));
     run(&mut s, "object.move", json!({"dx": 50, "dy": 0}));
     assert_eq!(effected(&s), *node(&s, a).path_data().unwrap());
+    // A parameter of another type than the manifest gives it is refused.
+    let before = (s.doc().unwrap().doc.clone(), s.doc().unwrap().history.undo.len());
+    let wrong = json!({"ids": [a.0], "effect": "plugin.test.engine.tri", "params": {"size": "4 pt"}});
+    let e = s.execute("effect.apply", &wrong).unwrap_err().to_string();
+    assert!(e.contains("`size` must be a number"), "{e}");
+    assert_eq!((s.doc().unwrap().doc.clone(), s.doc().unwrap().history.undo.len()), before);
     run(&mut s, "effect.apply", json!({"ids": [a.0], "effect": "plugin.test.engine.tri", "params": {"size": 4}}));
     assert_eq!(effected(&s), triangle());
+    let e = s.execute("effect.setParams", &json!({"ids": [a.0], "index": 1, "params": {"size": true}})).unwrap_err().to_string();
+    assert!(e.contains("`size` must be a number"), "{e}");
     assert_eq!(node(&s, a).appearance.effects[1].params, json!({"size": 4}));
     // Uninstalled: the geometry is drawn as it is.
     run(&mut s, "plugin.remove", json!({"id": "test.engine.tri"}));
@@ -327,6 +465,29 @@ fn expanding_a_fill_gives_its_plug_in_effect_the_fill_it_sits_on() {
     let group = s.doc().unwrap().selection.objects[0];
     let clip = node(&s, group).children().unwrap()[0].clone();
     assert_eq!(clip.path_data().unwrap().bounds(), triangle().bounds(), "the triangle the canvas fills");
+}
+
+/// A plug-in effect on a fill, before the fill's own 3D Revolve, is given the fill it sits on
+/// (`_context.item`), so the fill revolves the shape the plug-in returns for it.
+#[test]
+fn a_fills_revolve_gives_the_plug_in_effect_before_it_the_fill_it_sits_on() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let tri = json!({"objects": [{"path": triangle()}]}).to_string();
+    let on_fill = tpl::when_given(&tpl::manifest("test.engine.revolvefill", "effect", "{}"), tpl::Given::Params, r#""item":{"fill":0}"#, &tri);
+    install_wat(&mut s, &on_fill);
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "plugin.test.engine.revolvefill", "item": fill}));
+    run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "threeD.revolve", "item": fill}));
+    let n = node(&s, id);
+    // The same object with the triangle as its path and only the Revolve on its fill.
+    let mut expected = n.clone();
+    if let vectorcraft_doc::NodeKind::Path { path, .. } = &mut expected.kind {
+        *path = triangle();
+    }
+    expected.appearance.items[fill].effects_mut().retain(|e| e.id == "threeD.revolve");
+    let art = vectorcraft_render::effects::revolve_art(&n).unwrap();
+    assert_eq!(art, vectorcraft_render::effects::revolve_art(&expected).unwrap(), "the fill revolves the triangle");
 }
 
 /// The manifest of a test live effect `id` that declares `paintOutput` (at `api` 2), or that
@@ -452,6 +613,60 @@ fn a_painted_effect_on_a_fill_and_refused_results() {
     }
 }
 
+/// A fill's Drop Shadow before a painted effect that returns two fills, and a 200% Transform effect
+/// after it: the shadow of each returned fill follows the Transform effect. The square the effect
+/// returns spans 30 to 70 pt once scaled, so both half-opaque shadows, 20 pt to the right, cover
+/// 85 pt as they cover 75 pt.
+#[test]
+fn a_shadow_on_each_fill_a_painted_effect_returns_follows_the_transform_after_it() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let out = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#00ff00"), solid("#0000ff")]}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.shadowedfills", true), &out));
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    for (effect, params) in [
+        ("stylize.dropShadow", json!({"x": 10, "y": 0, "blur": 0, "opacity": 50})),
+        ("plugin.test.engine.shadowedfills", json!({})),
+        ("distort.transform", json!({"scaleH": 200, "scaleV": 200})),
+    ] {
+        run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": effect, "params": params, "item": fill}));
+    }
+    let img = drawn(&s);
+    let (near, far) = (img.pixel(75, 50), img.pixel(85, 50));
+    assert_ne!(near, WHITE, "the shadows reach past the square");
+    assert_eq!(far, near, "both shadows at 20 pt");
+}
+
+/// A Transform effect with Scale Strokes & Effects on after a painted effect on a fill leaves the
+/// Drop Shadow after it as it is on every paint the piece is drawn with.
+#[test]
+fn a_transform_after_a_painted_fill_effect_leaves_the_later_shadow_on_every_paint() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let two = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#00ff00"), solid("#0000ff")]}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.twopaints", true), &two));
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "plugin.test.engine.twopaints", "item": fill}));
+    let mut n = node(&s, id);
+    let later = [
+        vectorcraft_doc::Effect { id: "distort.transform".into(), params: json!({"scaleH": 200, "scaleV": 200, "strokes": true}), visible: true },
+        vectorcraft_doc::Effect { id: "stylize.dropShadow".into(), params: json!({"x": 10.0, "y": 0.0, "blur": 0.0}), visible: true },
+    ];
+    n.appearance.items[fill].effects_mut().extend(later);
+    let art = vectorcraft_render::effects::reshape(Some(&s.doc().unwrap().doc), &n, None).unwrap();
+    let mut offsets = vec![];
+    art.walk(&mut |m| {
+        for item in &m.appearance.items {
+            for r in vectorcraft_render::effects::raster_effects(item.effects()) {
+                if let vectorcraft_render::effects::RasterFx::DropShadow { dx, dy, .. } = r {
+                    offsets.push((dx, dy));
+                }
+            }
+        }
+    });
+    assert_eq!(offsets, [(10.0, 0.0), (10.0, 0.0)], "one shadow on each of the piece's two fills");
+}
+
 /// A result refused for a swatch the document doesn't have stays cached: once the document has the
 /// swatch, the next check of that result clears the error.
 #[test]
@@ -503,6 +718,30 @@ fn a_painted_group_effect_links_to_the_document_s_swatches() {
     run(&mut s, "effect.apply", json!({"ids": [g.0], "effect": "plugin.test.engine.grouppaint"}));
     let img = drawn(&s);
     assert_eq!((img.pixel(50, 50), img.pixel(15, 15)), (GREEN, WHITE), "the group's piece, green");
+}
+
+/// A painted effect on a group leaves the group's art as it is when a path in it has a linked
+/// opacity mask, which can't take the pieces as the path does: the mask still covers the path.
+#[test]
+fn a_painted_group_effect_leaves_art_with_a_linked_mask_as_it_is() {
+    let mut s = session();
+    let a = rect(&mut s, 10.0, "#ff0000");
+    let m = rect(&mut s, 10.0, "#ffffff");
+    run(&mut s, "select.set", json!({"ids": [a.0, m.0]}));
+    run(&mut s, "transparency.makeOpacityMask", json!({}));
+    rect(&mut s, 100.0, "#0000ff");
+    run(&mut s, "select.all", json!({}));
+    let g = NodeId(run(&mut s, "object.group", json!({}))["id"].as_u64().unwrap());
+    let out = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#00ff00")]}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.maskedpaint", true), &out));
+    run(&mut s, "effect.apply", json!({"ids": [g.0], "effect": "plugin.test.engine.maskedpaint"}));
+    let art = vectorcraft_render::effects::evaluate_container(Some(&s.doc().unwrap().doc), &node(&s, g)).unwrap();
+    let mut masked = vec![];
+    art.walk(&mut |c| masked.extend(c.extras().mask.as_ref().map(|k| (c.geometric_bounds(), k.art.geometric_bounds()))));
+    assert!(!masked.is_empty(), "the masked path");
+    for (path, mask) in masked {
+        assert_eq!(path, mask, "the mask covers the path");
+    }
 }
 
 /// The output of a painted effect that returns one green square linked to swatch `Leaf`.
@@ -644,6 +883,27 @@ fn expanding_a_gradient_fill_keeps_each_piece_s_own_paint() {
     }
 }
 
+/// `object.expand.info` measures each piece a painted effect returns: a piece whose repeating
+/// gradient needs more runs across it than are written (1,000) reports no gradient to expand, as
+/// Expand leaves it a gradient, and the same gradient in 10 runs reports one.
+#[test]
+fn expand_info_measures_the_gradient_on_each_painted_piece() {
+    for (end, expands) in [(120.0, true), (100.2, false)] {
+        let mut s = session();
+        let id = rect(&mut s, 10.0, "#ff0000");
+        let gradient = json!({"kind": "linear", "spread": "repeat", "repeats": 10, "start": [100, 50], "end": [end, 50]});
+        run(&mut s, "paint.setFill", json!({"ids": [id.0], "gradient": gradient}));
+        let out = json!({"objects": [{"path": square_at(100.0)}]}).to_string();
+        install_wat(&mut s, &tpl::returning(&painting("test.engine.expandruns", true), &out));
+        run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "plugin.test.engine.expandruns"}));
+        run(&mut s, "select.set", json!({"ids": [id.0]}));
+        let info = s.execute("object.expand.info", &json!({})).unwrap();
+        assert_eq!((info["gradient"].clone(), info["fill"].clone()), (json!(expands), json!(expands)), "{end}");
+        let only_fill = s.execute("object.expand", &json!({"object": false, "fill": true, "stroke": false}));
+        assert_eq!(only_fill.is_ok(), expands, "{end}: {only_fill:?}");
+    }
+}
+
 /// Object › Expand of a pattern fill works piece by piece: a piece that keeps the pattern has its
 /// tiles expanded, and a piece with a paint of its own keeps that paint.
 #[test]
@@ -666,30 +926,269 @@ fn expanding_a_pattern_fill_keeps_each_piece_s_own_paint() {
     assert_eq!(patterns, 0, "the tiles are objects");
 }
 
-/// Two painted effects on one fill, the first returning a piece with two fills: the second replaces
-/// the first of them and the other fill stays over it.
+/// A path's bounds and the paints of its fills and strokes, each stroke with its weight.
+type PaintedPath = (Option<vectorcraft_geom::Rect>, Vec<(Paint, Option<f64>)>);
+
+/// The paths of `id`'s reshaped art that paint, in paint order, each with the fills and strokes of
+/// it that paint.
+fn painted_paths(s: &Session, id: NodeId) -> Vec<PaintedPath> {
+    let st = s.doc().unwrap();
+    let art = vectorcraft_render::effects::reshape(Some(&st.doc), st.doc.node(id).unwrap(), None).unwrap();
+    let mut paths = vec![];
+    art.walk(&mut |n| {
+        if let Some(p) = n.path_data() {
+            let items: Vec<_> = n
+                .appearance
+                .items
+                .iter()
+                .map(|i| match i {
+                    vectorcraft_doc::AppearanceItem::Fill(f) => (f.paint.clone(), None),
+                    vectorcraft_doc::AppearanceItem::Stroke(st) => (st.paint.clone(), Some(st.width)),
+                })
+                .filter(|(paint, _)| !paint.is_none())
+                .collect();
+            if !items.is_empty() {
+                paths.push((p.bounds(), items));
+            }
+        }
+    });
+    paths
+}
+
+fn paint(hex: &str) -> Paint {
+    Paint::solid(Color::from_hex(hex).unwrap())
+}
+
+/// Two painted effects on one fill, the first returning a piece with two fills: the second runs on
+/// each of them, told which fill it is on. On the second fill it returns a blue square at 80 pt; on
+/// the first it returns a result that is refused, which leaves only that fill, red, on the square at
+/// 40 pt.
 #[test]
-fn a_second_painted_effect_on_a_fill_keeps_the_piece_s_other_fills() {
+fn a_later_painted_effect_runs_on_every_fill_a_piece_returns() {
     let mut s = session();
     let id = rect(&mut s, 10.0, "#ff0000");
     let two = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#ff0000"), solid("#00ff00")]}]}).to_string();
-    let one = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#0000ff")]}]}).to_string();
+    let blue = json!({"objects": [{"path": square_at(80.0), "fills": [solid("#0000ff")]}]}).to_string();
     install_wat(&mut s, &tpl::returning(&painting("test.engine.twofills", true), &two));
-    install_wat(&mut s, &tpl::returning(&painting("test.engine.onefill", true), &one));
+    install_wat(&mut s, &tpl::when_given(&painting("test.engine.onsecond", true), tpl::Given::Params, r#""item":{"fill":1}"#, &blue));
     let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
     run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "plugin.test.engine.twofills", "item": fill}));
-    run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "plugin.test.engine.onefill", "item": fill}));
-    assert_eq!(drawn(&s).pixel(50, 50), GREEN, "the other fill paints over the replaced one");
+    run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "plugin.test.engine.onsecond", "item": fill}));
+    let img = drawn(&s);
+    assert_eq!((img.pixel(50, 50), img.pixel(90, 50)), (RED, BLUE), "the first fill as it was, the second moved and blue");
+    let (a, b) = (square_at(40.0).bounds(), square_at(80.0).bounds());
+    assert_eq!(painted_paths(&s, id), [(a, vec![(paint("#ff0000"), None)]), (b, vec![(paint("#0000ff"), None)])]);
+    // The same result for both fills: each is replaced.
+    let one = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#0000ff")]}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.onsecond", true), &one));
+    assert_eq!(painted_paths(&s, id), [(a, vec![(paint("#0000ff"), None)]), (a, vec![(paint("#0000ff"), None)])]);
+}
+
+/// On a stroke, a later painted effect runs on each stroke the first returns, with its own weight
+/// and place among them, and keeps their order.
+#[test]
+fn a_later_painted_effect_runs_on_every_stroke_a_piece_returns() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    run(&mut s, "paint.setStroke", json!({"ids": [id.0], "color": "#000000"}));
+    let two = json!({"objects": [{"path": square_at(40.0), "strokes": [{"paint": solid("#ff0000"), "width": 2}, {"paint": solid("#00ff00"), "width": 6}]}]})
+        .to_string();
+    let blue = json!({"objects": [{"path": square_at(80.0), "strokes": [{"paint": solid("#0000ff"), "width": 4}]}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.twostrokes", true), &two));
+    install_wat(&mut s, &tpl::when_given(&painting("test.engine.onsecondstroke", true), tpl::Given::Params, r#""item":{"stroke":1}"#, &blue));
+    let stroke = node(&s, id).appearance.items.iter().position(|i| !i.is_fill()).unwrap();
+    for effect in ["plugin.test.engine.twostrokes", "plugin.test.engine.onsecondstroke"] {
+        run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": effect, "item": stroke}));
+    }
+    let stroked: Vec<_> = painted_paths(&s, id).into_iter().filter(|(_, items)| items.iter().any(|(_, w)| w.is_some())).collect();
+    let (a, b) = (square_at(40.0).bounds(), square_at(80.0).bounds());
+    assert_eq!(stroked, [(a, vec![(paint("#ff0000"), Some(2.0))]), (b, vec![(paint("#0000ff"), Some(4.0))])]);
+}
+
+/// A third painted effect runs on every fill the second returned, for each fill the first returned.
+#[test]
+fn a_third_painted_effect_visits_every_fill_from_the_second() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let first = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#ff0000"), solid("#00ff00")]}]}).to_string();
+    let second = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#0000ff"), solid("#00ffff")]}]}).to_string();
+    let third = json!({"objects": [{"path": square_at(80.0), "fills": [solid("#ffff00")]}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.third.a", true), &first));
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.third.b", true), &second));
+    install_wat(&mut s, &tpl::when_given(&painting("test.engine.third.c", true), tpl::Given::Params, r#""item":{"fill":1}"#, &third));
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    for effect in ["a", "b", "c"] {
+        run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": format!("plugin.test.engine.third.{effect}"), "item": fill}));
+    }
+    let (a, b) = (square_at(40.0).bounds(), square_at(80.0).bounds());
+    let pair = [(a, vec![(paint("#0000ff"), None)]), (b, vec![(paint("#ffff00"), None)])];
+    assert_eq!(painted_paths(&s, id), [pair.clone(), pair].concat());
+}
+
+/// A later live effect that changes geometry only runs on each fill a painted effect returned, told
+/// which fill it is on: on the second it moves the square to 80 pt, and the first stays at 40 pt.
+#[test]
+fn a_later_geometry_effect_uses_each_generated_fill_s_context() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let two = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#ff0000"), solid("#00ff00")]}]}).to_string();
+    let moved = json!({"objects": [{"path": square_at(80.0)}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.geomfills", true), &two));
+    install_wat(&mut s, &tpl::when_given(&painting("test.engine.geomsecond", false), tpl::Given::Params, r#""item":{"fill":1}"#, &moved));
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    for effect in ["plugin.test.engine.geomfills", "plugin.test.engine.geomsecond"] {
+        run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": effect, "item": fill}));
+    }
+    let (a, b) = (square_at(40.0).bounds(), square_at(80.0).bounds());
+    assert_eq!(painted_paths(&s, id), [(a, vec![(paint("#ff0000"), None)]), (b, vec![(paint("#00ff00"), None)])]);
+}
+
+/// A later Outline Stroke effect runs on each stroke a painted effect returned, with that stroke's
+/// weight: the 2 pt stroke's outline is 22 pt wide and the 6 pt stroke's 26 pt, in their order.
+#[test]
+fn a_later_outline_stroke_uses_each_generated_stroke_s_weight() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    run(&mut s, "paint.setStroke", json!({"ids": [id.0], "color": "#000000"}));
+    let two = json!({"objects": [{"path": square_at(40.0), "strokes": [{"paint": solid("#ff0000"), "width": 2}, {"paint": solid("#00ff00"), "width": 6}]}]})
+        .to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.outlinestrokes", true), &two));
+    let stroke = node(&s, id).appearance.items.iter().position(|i| !i.is_fill()).unwrap();
+    run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "plugin.test.engine.outlinestrokes", "item": stroke}));
+    run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "path.outlineStroke", "params": {}, "item": stroke}));
     let st = s.doc().unwrap();
     let art = vectorcraft_render::effects::reshape(Some(&st.doc), st.doc.node(id).unwrap(), None).unwrap();
-    let mut paints = vec![];
+    // Each outline is a compound path (the ring around the square): its width and its strokes.
+    let mut outlines = vec![];
     art.walk(&mut |n| {
-        if n.path_data().is_some() {
-            paints.push(n.appearance.items.iter().filter(|i| i.is_fill()).map(|i| i.paint().clone()).collect::<Vec<_>>());
+        if let vectorcraft_doc::NodeKind::Compound { children, .. } = &n.kind {
+            let bounds = children.iter().filter_map(|c| c.path_data().and_then(PathData::bounds)).reduce(|a, b| a.union(b));
+            let strokes: Vec<_> = n
+                .appearance
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    vectorcraft_doc::AppearanceItem::Stroke(st) => Some((st.paint.clone(), st.width)),
+                    vectorcraft_doc::AppearanceItem::Fill(_) => None,
+                })
+                .collect();
+            outlines.push((bounds.map(|b| (b.width() * 1000.0).round() / 1000.0), strokes));
         }
     });
-    let fill = |hex: &str| Paint::solid(Color::from_hex(hex).unwrap());
-    assert!(paints.contains(&vec![fill("#0000ff"), fill("#00ff00")]), "{paints:?}");
+    assert_eq!(
+        outlines,
+        [(Some(22.0), vec![(paint("#ff0000"), 2.0)]), (Some(26.0), vec![(paint("#00ff00"), 6.0)])],
+        "each stroke is outlined at its own weight"
+    );
+}
+
+/// A later painted effect's runs on the fills a piece returned share the effects' budget: each run
+/// that fits gives all its pieces, and once the budget is spent the remaining fills stay together
+/// on the piece's path, with none of their run's pieces.
+#[test]
+fn painted_fills_share_the_budget_without_partial_results() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let fills = vec![solid("#ff0000"); vectorcraft_plugins::objects::MAX_ITEMS];
+    let first = json!({"objects": [{"path": square_at(40.0), "fills": fills}]}).to_string();
+    let tiny = PathData::single(SubPath::polyline(&[Point::new(0.0, 0.0), Point::new(0.1, 0.0), Point::new(0.0, 0.1)], true));
+    let many = json!({"objects": vec![json!({"path": tiny}); 400]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.budget.fills", true), &first));
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.budget.many", true), &many));
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    for effect in ["plugin.test.engine.budget.fills", "plugin.test.engine.budget.many"] {
+        run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": effect, "item": fill}));
+    }
+    let paths = painted_paths(&s, id);
+    let tinies = paths.iter().filter(|(b, _)| *b == tiny.bounds()).count();
+    let kept: Vec<_> = paths.iter().filter(|(b, _)| *b == square_at(40.0).bounds()).collect();
+    assert_eq!(kept.len(), 1, "the fills left out stay together");
+    let ran = vectorcraft_plugins::objects::MAX_ITEMS - kept[0].1.len();
+    assert!(ran > 1 && !kept[0].1.is_empty(), "{ran} runs gave their pieces");
+    assert_eq!(tinies, ran * 400, "every run that fit gave all its pieces");
+    assert!(paths.len() <= vectorcraft_plugins::objects::MAX_OBJECTS, "{} paths", paths.len());
+}
+
+/// A later painted effect runs on each of 256 fills a painted effect returned on an 8,000-anchor
+/// path, although 256 copies of that path would pass the effects' budget, when what it returns
+/// fits.
+#[test]
+fn a_later_painted_effect_runs_on_many_fills_of_a_large_piece_when_its_results_fit() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let zigzag: Vec<Point> = (0..8_000).map(|i| Point::new(40.0 + f64::from(i) * 20.0 / 8_000.0, if i % 2 == 0 { 40.0 } else { 60.0 })).collect();
+    let large = PathData::single(SubPath::polyline(&zigzag, true));
+    let fills = vec![solid("#ff0000"); vectorcraft_plugins::objects::MAX_ITEMS];
+    let first = json!({"objects": [{"path": large, "fills": fills}]}).to_string();
+    let tiny = PathData::single(SubPath::polyline(&[Point::new(0.0, 0.0), Point::new(0.1, 0.0), Point::new(0.0, 0.1)], true));
+    let small = json!({"objects": [{"path": tiny}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.large.fills", true), &first));
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.large.small", true), &small));
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    for effect in ["plugin.test.engine.large.fills", "plugin.test.engine.large.small"] {
+        run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": effect, "item": fill}));
+    }
+    let paths = painted_paths(&s, id);
+    let tinies = paths.iter().filter(|(b, _)| *b == tiny.bounds()).count();
+    assert_eq!(tinies, vectorcraft_plugins::objects::MAX_ITEMS, "every fill's run");
+    assert!(paths.iter().all(|(b, _)| *b != large.bounds()), "no fill left on the large path");
+}
+
+/// An open path of `curves` tall curves, each drawn with about 5,200 lines.
+fn tall_curves(curves: u32) -> PathData {
+    let h = 3_000_000.0;
+    let anchors = (0..=curves)
+        .map(|i| {
+            let x = 40.0 + f64::from(i);
+            vectorcraft_geom::Anchor::with_handles(Point::new(x, 0.0), Point::new(x, -h), Point::new(x, h))
+        })
+        .collect();
+    PathData::single(SubPath::new(anchors, false))
+}
+
+/// A later painted effect's run on the first of two fills a painted effect returned on a path that
+/// takes most of the effects' budget gives its result when it and the second fill's result fit
+/// together, although the result and another copy of the path would not.
+#[test]
+fn a_later_painted_run_counts_the_results_after_it_before_keeping_room_for_its_input() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let (large, result) = (tall_curves(1_000), tall_curves(600));
+    let tiny = PathData::single(SubPath::polyline(&[Point::new(0.0, 0.0), Point::new(0.1, 0.0), Point::new(0.0, 0.1)], true));
+    let two = json!({"objects": [{"path": large, "fills": [solid("#ff0000"), solid("#00ff00")]}]}).to_string();
+    let on_first = json!({"objects": [{"path": result}]}).to_string();
+    let on_second = json!({"objects": [{"path": tiny}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.tall.fills", true), &two));
+    let second = painting("test.engine.tall.each", true);
+    install_wat(&mut s, &tpl::when_given_else(&second, tpl::Given::Params, r#""item":{"fill":0}"#, &on_first, &on_second));
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    for effect in ["plugin.test.engine.tall.fills", "plugin.test.engine.tall.each"] {
+        run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": effect, "item": fill}));
+    }
+    let want = [(result.bounds(), vec![(paint("#ff0000"), None)]), (tiny.bounds(), vec![(paint("#00ff00"), None)])];
+    assert_eq!(painted_paths(&s, id), want, "both runs give their results");
+}
+
+/// When the results of a later painted effect's runs on the two fills of a large path do not fit
+/// together, and the first fill's result and another copy of the path do not fit either, the first
+/// fill stays on the path and the second fill's result, which fits beside the path, is drawn.
+#[test]
+fn a_later_painted_run_that_did_not_fit_beside_an_earlier_result_fits_once_that_is_left_out() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let (large, first, second) = (tall_curves(577), tall_curves(1_058), tall_curves(770));
+    let two = json!({"objects": [{"path": large, "fills": [solid("#ff0000"), solid("#00ff00")]}]}).to_string();
+    let on_first = json!({"objects": [{"path": first}]}).to_string();
+    let on_second = json!({"objects": [{"path": second}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.refit.fills", true), &two));
+    let each = painting("test.engine.refit.each", true);
+    install_wat(&mut s, &tpl::when_given_else(&each, tpl::Given::Params, r#""item":{"fill":0}"#, &on_first, &on_second));
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    for effect in ["plugin.test.engine.refit.fills", "plugin.test.engine.refit.each"] {
+        run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": effect, "item": fill}));
+    }
+    let want = [(large.bounds(), vec![(paint("#ff0000"), None)]), (second.bounds(), vec![(paint("#00ff00"), None)])];
+    assert_eq!(painted_paths(&s, id), want, "the second fill's result is drawn");
 }
 
 /// A Transform effect before a painted effect on a fill moves the fill's placed gradient: a piece
@@ -788,9 +1287,41 @@ fn pathfinder_takes_swatch_linked_pieces_of_type_in_a_reshaped_group() {
 fn an_image_s_painted_fill_is_hit_and_measured_as_drawn() {
     let mut s = session();
     let mut png = vec![];
-    image::RgbaImage::from_pixel(30, 30, image::Rgba([255, 0, 0, 255]))
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .unwrap();
+    {
+        let __dyn: image::DynamicImage = (image::RgbaImage::from_pixel(30, 30, image::Rgba([255, 0, 0, 255]))).into();
+        let (__w, __h) = (__dyn.width(), __dyn.height());
+        let (__layout, __sample, __raw) = match __dyn {
+            image::DynamicImage::ImageLuma8(b) => (craft_image_codecs::ChannelLayout::Gray, craft_image_codecs::SampleType::U8, b.into_raw()),
+            image::DynamicImage::ImageLumaA8(b) => (craft_image_codecs::ChannelLayout::GrayA, craft_image_codecs::SampleType::U8, b.into_raw()),
+            image::DynamicImage::ImageRgb8(b) => (craft_image_codecs::ChannelLayout::Rgb, craft_image_codecs::SampleType::U8, b.into_raw()),
+            image::DynamicImage::ImageRgba8(b) => (craft_image_codecs::ChannelLayout::Rgba, craft_image_codecs::SampleType::U8, b.into_raw()),
+            image::DynamicImage::ImageLuma16(b) => (
+                craft_image_codecs::ChannelLayout::Gray,
+                craft_image_codecs::SampleType::U16,
+                b.into_raw().into_iter().flat_map(|s| s.to_ne_bytes()).collect(),
+            ),
+            image::DynamicImage::ImageLumaA16(b) => (
+                craft_image_codecs::ChannelLayout::GrayA,
+                craft_image_codecs::SampleType::U16,
+                b.into_raw().into_iter().flat_map(|s| s.to_ne_bytes()).collect(),
+            ),
+            image::DynamicImage::ImageRgb16(b) => (
+                craft_image_codecs::ChannelLayout::Rgb,
+                craft_image_codecs::SampleType::U16,
+                b.into_raw().into_iter().flat_map(|s| s.to_ne_bytes()).collect(),
+            ),
+            image::DynamicImage::ImageRgba16(b) => (
+                craft_image_codecs::ChannelLayout::Rgba,
+                craft_image_codecs::SampleType::U16,
+                b.into_raw().into_iter().flat_map(|s| s.to_ne_bytes()).collect(),
+            ),
+            other => (craft_image_codecs::ChannelLayout::Rgba, craft_image_codecs::SampleType::U8, other.into_rgba8().into_raw()),
+        };
+        let __cimg = craft_image_codecs::Image::from_raw(__w, __h, __layout, __sample, __raw).unwrap();
+        craft_image_codecs::encode(&__cimg, craft_image_codecs::Format::Png, &craft_image_codecs::EncodeOptions::default())
+            .map(|__b| png.extend_from_slice(&__b))
+    }
+    .unwrap();
     let r = run(&mut s, "file.place", json!({"name": "red.png", "dataBase64": vectorcraft_format::base64_encode(&png), "at": [65, 65]}));
     let im = NodeId(r["ids"][0].as_u64().unwrap());
     run(&mut s, "swatch.new", json!({"name": "Leaf", "color": "#00ff00"}));
@@ -1053,6 +1584,39 @@ fn the_first_view_defers_plug_in_effects_past_its_budget() {
     assert_eq!(fx_c.take_report(), Some(0));
 }
 
+/// A later painted effect deferred on the fills a piece returned is listed once, at its place among
+/// the object's fill's effects, and a refresh of the object runs it on each of them.
+#[test]
+fn deferred_runs_on_the_fills_a_piece_returned_keep_the_fill_s_stage() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let two = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#ff0000"), solid("#00ff00")]}]}).to_string();
+    let blue = json!({"objects": [{"path": square_at(80.0), "fills": [solid("#0000ff")]}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.deferred.two", true), &two));
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.deferred.later", true), &blue));
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "plugin.test.engine.deferred.two", "item": fill}));
+    // The first effect's result is kept from a drawing outside a view's budget.
+    assert_eq!(drawn(&s).pixel(50, 50), GREEN);
+    run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "plugin.test.engine.deferred.later", "item": fill}));
+    let step = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(3_000));
+    let fx = vectorcraft_plugins::deferred::Deferrals::with_clock(stepping_clock(&step));
+    s.doc_mut().unwrap().plugin_effects = fx.clone();
+    let img = fx.view(|| drawn(&s));
+    assert_eq!((img.pixel(50, 50), img.pixel(90, 50)), (GREEN, WHITE), "the fills on the first effect's piece");
+    let places = run(&mut s, "effect.deferredStatus", json!({}))["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["objectId"].as_u64().unwrap(), e["item"].as_u64(), e["effectIndex"].as_u64().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(places, [(id.0, Some(fill as u64), 1)], "the fill's stage, listed once");
+    step.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(run(&mut s, "effect.refreshDeferred", json!({"ids": [id.0]})), json!({"refreshed": 1, "stillDeferred": 0, "failed": 0}));
+    let img = fx.view(|| drawn(&s));
+    assert_eq!((img.pixel(50, 50), img.pixel(90, 50)), (WHITE, BLUE), "both fills replaced");
+}
+
 /// Deferred stages are listed where their effects are: after an effect that changes no geometry,
 /// and on a fill after a Transform effect that reaches its appearance, each of two instances of
 /// one plug-in at its own place.
@@ -1298,6 +1862,7 @@ fn filters_set_effects_and_stroke_styles() {
         ("test.engine.badn", json!([{"id": "plugin.test.engine.fx", "params": {"n": "two"}}]), "`n`"),
         ("test.engine.file", json!([{"id": "distort.glass", "params": {"textureImage": {"path": "/etc/hosts"}}}]), "textureImage"),
         ("test.engine.file2", json!([{"id": "texture.texturizer", "params": {"textureImage": {"path": "/etc/hosts"}}}]), "textureImage"),
+        ("test.engine.file3", json!([{"id": "artistic.roughPastels", "params": {"textureImage": {"path": "/etc/hosts"}}}]), "textureImage"),
         ("test.engine.two3d", json!([{"id": "threeD.extrude"}, {"id": "threeD.extrude"}]), "one 3D effect"),
     ] {
         let e = filter(&mut s, name, fx).unwrap_err().to_string();
@@ -1373,6 +1938,86 @@ fn filters_keep_their_data_with_the_document() {
     assert_eq!(data(&s), None);
 }
 
+/// A filter run whose output changes nothing (an echo) records no undo step, leaves a saved
+/// document unmodified and the document as it was, and still selects its objects. One that changes
+/// one of the objects records exactly one step, and running it again records none.
+#[test]
+fn a_filter_run_that_changes_nothing_records_no_undo_step() {
+    let mut s = session();
+    let a = rect(&mut s, 10.0, "#ff0000");
+    let b = rect(&mut s, 40.0, "#0000ff");
+    let echo = "test.engine.noop.echo";
+    install_wat(&mut s, &tpl::module(&tpl::manifest(echo, "filter", "{}"), tpl::ECHO, "", 1));
+    run(&mut s, "select.none", json!({}));
+    s.doc_mut().unwrap().mark_saved();
+    let (doc, undo) = (s.doc().unwrap().doc.clone(), s.doc().unwrap().history.undo.len());
+    let r = run(&mut s, "plugin.run", json!({"id": echo, "ids": [a.0, b.0]}));
+    assert_eq!(r["ids"], json!([a.0, b.0]));
+    let st = s.doc().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&st.doc, &doc), "the document stays as it was");
+    assert_eq!((st.history.undo.len(), st.is_dirty()), (undo, false), "no undo step; still saved");
+    assert_eq!(st.selection.objects, [a, b], "its objects are selected");
+    // Renaming one object of the two is one undo step.
+    let renamer = "test.engine.noop.renamer";
+    let renamed = json!({"objects": [{"id": a.0, "name": "Renamed"}, {"id": b.0}]});
+    install_wat(&mut s, &tpl::returning(&tpl::manifest(renamer, "filter", "{}"), &renamed.to_string()));
+    run(&mut s, "plugin.run", json!({"id": renamer, "ids": [a.0, b.0]}));
+    let st = s.doc().unwrap();
+    assert_eq!((st.history.undo.len(), st.is_dirty()), (undo + 1, true));
+    assert_eq!(node(&s, a).name.as_deref(), Some("Renamed"));
+    // Run again, it renames nothing: no second step.
+    run(&mut s, "plugin.run", json!({"id": renamer, "ids": [a.0, b.0]}));
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo + 1);
+    for id in [echo, renamer] {
+        run(&mut s, "plugin.remove", json!({"id": id}));
+    }
+}
+
+/// A filter that writes the data it already keeps with the document records no undo step; writing
+/// other data, or removing it, records one, and removing data it does not keep records none.
+#[test]
+fn a_filter_that_keeps_the_same_data_records_no_undo_step() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let pid = "test.engine.noop.data";
+    let keep = |s: &mut Session, data: Value| {
+        let out = json!({"objects": [{"id": id.0}], "documentData": data});
+        install_wat(s, &tpl::returning(&tpl::manifest(pid, "filter", "{}"), &out.to_string()));
+        run(s, "plugin.run", json!({"id": pid, "ids": [id.0]}));
+        s.doc().unwrap().history.undo.len()
+    };
+    let undo = s.doc().unwrap().history.undo.len();
+    assert_eq!(keep(&mut s, json!({"pen": 2})), undo + 1);
+    assert_eq!(keep(&mut s, json!({"pen": 2})), undo + 1, "the same data: no step");
+    assert_eq!(keep(&mut s, json!({"pen": 3})), undo + 2);
+    assert_eq!(keep(&mut s, Value::Null), undo + 3, "removed");
+    assert_eq!(keep(&mut s, Value::Null), undo + 3, "nothing kept to remove: no step");
+    assert_eq!(s.doc().unwrap().doc.plugin_data(pid), None);
+    run(&mut s, "plugin.remove", json!({"id": pid}));
+}
+
+/// A plug-in command whose run changes nothing records no undo step, and so does a filter or a
+/// command that may call commands and hands back what it is given.
+#[test]
+fn a_plugin_command_that_changes_nothing_records_no_undo_step() {
+    let mut s = session();
+    rect(&mut s, 10.0, "#ff0000");
+    run(&mut s, "select.all", json!({}));
+    let undo = s.doc().unwrap().history.undo.len();
+    let id = "test.engine.noop.cmds";
+    install_wat(&mut s, &grower(id));
+    run(&mut s, &format!("plugin.{id}.tidy"), json!({}));
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo, "tidy hands back its input");
+    run(&mut s, "plugin.remove", json!({"id": id}));
+    let calling = "test.engine.noop.calling";
+    install_echo_calling(&mut s, calling, r#"[{"id":"same","label":"Same"}]"#);
+    run(&mut s, &format!("plugin.{calling}.same"), json!({}));
+    run(&mut s, "plugin.run", json!({"id": calling}));
+    assert!(!s.in_interaction());
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo, "an echo that may call commands");
+    run(&mut s, "plugin.remove", json!({"id": calling}));
+}
+
 #[test]
 fn plugin_management_commands() {
     let _folder = PREFS_FOLDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -1433,6 +2078,98 @@ fn plugins_folder_set_again_after_clearing_installs_its_plugins() {
     run(&mut s, "plugin.remove", json!({"id": id}));
 }
 
+/// Under automation read roots, `plugin.list` names the plug-in folder last loaded, its failed
+/// files and a plug-in's source file only inside them: a folder outside is `null`, and a file
+/// outside is named by its file name.
+#[test]
+fn plugin_list_leaves_out_paths_outside_the_read_root() {
+    use crate::file_access::{AutomationRoots, confine};
+    let _folder = PREFS_FOLDER.lock().unwrap_or_else(|e| e.into_inner());
+    let base = crate::tests_links::Folder::new("plugin-list-read-root");
+    let (inside, outside) = (base.0.join("in"), base.0.join("out"));
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let id = "test.engine.listroots";
+    let src = tpl::returning(&tpl::manifest(id, "filter", "{}"), r#"{"objects":[]}"#);
+    std::fs::write(outside.join("hidden.wasm"), wat::parse_str(src).unwrap()).unwrap();
+    std::fs::write(outside.join("broken.wasm"), b"\0asm?").unwrap();
+    let folder = outside.to_string_lossy().to_string();
+    let mut s = session();
+    let r = run(&mut s, "plugin.reload", json!({"path": folder}));
+    assert_eq!(r["loaded"], json!([id]), "{r}");
+    let broken = outside.join("broken.wasm").to_string_lossy().to_string();
+    let source = outside.join("hidden.wasm").to_string_lossy().to_string();
+    let entry = |list: &Value| list["plugins"].as_array().unwrap().iter().find(|p| p["id"] == id).cloned().unwrap();
+
+    // The person sees the paths.
+    let person = run(&mut s, "plugin.list", json!({}));
+    assert_eq!((&person["folder"]["folder"], &person["folder"]["failed"][0]["file"]), (&json!(folder), &json!(broken)), "{person}");
+    assert_eq!(entry(&person)["source"], json!(source));
+
+    // The client sees their names.
+    let roots = AutomationRoots::new(&[&inside], &[]).unwrap();
+    let listed = confine(roots.as_ref(), || s.execute("plugin.list", &json!({}))).unwrap();
+    let report = &listed["folder"];
+    assert_eq!((&report["folder"], &report["loaded"], &report["failed"][0]["file"]), (&Value::Null, &json!([id]), &json!("broken.wasm")), "{listed}");
+    assert_eq!(entry(&listed)["source"], "hidden.wasm");
+    let info = confine(roots.as_ref(), || s.execute("plugin.info", &json!({"id": id}))).unwrap();
+    assert_eq!(info["source"], "hidden.wasm");
+    let outside_text = json!(folder).to_string();
+    for reply in [&listed, &info] {
+        assert!(!reply.to_string().contains(outside_text.trim_matches('"')), "no path outside the root: {reply}");
+    }
+
+    // A read root holding the folder shows it whole.
+    let wider = AutomationRoots::new(&[&outside], &[]).unwrap();
+    let listed = confine(wider.as_ref(), || s.execute("plugin.list", &json!({}))).unwrap();
+    assert_eq!(listed["folder"]["folder"], json!(folder), "{listed}");
+    run(&mut s, "plugin.remove", json!({"id": id}));
+}
+
+/// Under automation read roots, a plug-in turned off for the next launch is listed with a file
+/// outside them named by its file name, and `plugin.setEnabled` turns it on by that name.
+#[test]
+fn disabled_plugins_name_files_outside_the_read_root_by_their_names() {
+    if !in_own_process("disabled_plugins_name_files_outside_the_read_root_by_their_names") {
+        return;
+    }
+    use crate::file_access::{AutomationRoots, confine};
+    let base = crate::tests_links::Folder::new("plugin-disabled-read-root");
+    let (inside, outside) = (base.0.join("in"), base.0.join("out"));
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let id = "test.engine.disabledroots";
+    let src = tpl::returning(&tpl::manifest(id, "filter", "{}"), r#"{"objects":[]}"#);
+    let file = outside.join("off.wasm");
+    std::fs::write(&file, wat::parse_str(src).unwrap()).unwrap();
+    let file = file.to_string_lossy().to_string();
+    let mut s = session();
+    run(&mut s, "plugin.install", json!({"path": file}));
+    let roots = AutomationRoots::new(&[&inside], &[]).unwrap();
+    // The client turns it off by the source plugin.list shows.
+    let listed = confine(roots.as_ref(), || s.execute("plugin.list", &json!({}))).unwrap();
+    let source = listed["plugins"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap()["source"].clone();
+    assert_eq!(source, "off.wasm", "{listed}");
+    confine(roots.as_ref(), || s.execute("plugin.setEnabled", &json!({"file": source, "enabled": false}))).unwrap();
+    assert_eq!(run(&mut s, "plugin.safeMode", json!({}))["disabled"][0]["file"], json!(file), "the person sees the path");
+
+    let outside_text = json!(outside.to_string_lossy()).to_string();
+    for cmd in ["plugin.list", "plugin.safeMode"] {
+        let r = confine(roots.as_ref(), || s.execute(cmd, &json!({}))).unwrap();
+        assert_eq!(r["disabled"][0]["file"], "off.wasm", "{cmd}: {r}");
+        assert!(!r.to_string().contains(outside_text.trim_matches('"')), "{cmd}: no path outside the root: {r}");
+    }
+    let r = confine(roots.as_ref(), || s.execute("plugin.setEnabled", &json!({"file": "off.wasm", "enabled": true}))).unwrap();
+    assert_eq!((&r["changed"], &r["disabled"]), (&json!(true), &json!([])), "{r}");
+    run(&mut s, "plugin.remove", json!({"id": id}));
+}
+
+/// The files and folders in the plug-in store `dir`, without the file windows lock while they
+/// change it.
+fn store_files(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir).unwrap().filter(|e| e.as_ref().is_ok_and(|e| e.file_name() != crate::store::DISABLED_LOCK)).count()
+}
+
 /// #2541: a plug-in installed in a session with a plug-in store is installed again in the next
 /// session that attaches the store, and Remove Plug-in takes it out of the store.
 #[test]
@@ -1443,14 +2180,14 @@ fn installed_plugins_are_kept_in_the_store() {
     let mut s = session();
     s.attach_plugin_store(folder.0.clone());
     install_wat(&mut s, &src);
-    assert_eq!(std::fs::read_dir(&folder.0).unwrap().count(), 1, "one file in the store");
+    assert_eq!(store_files(&folder.0), 1, "one file in the store");
     vectorcraft_plugins::registry::remove(id);
 
     let mut next = session();
     next.attach_plugin_store(folder.0.clone());
     assert!(vectorcraft_plugins::registry::get(id).is_some(), "installed again from the store");
     run(&mut next, "plugin.remove", json!({"id": id}));
-    assert_eq!(std::fs::read_dir(&folder.0).unwrap().count(), 0, "removed from the store");
+    assert_eq!(store_files(&folder.0), 0, "removed from the store");
 
     // A file that isn't a plug-in is skipped; the store still attaches.
     std::fs::write(folder.0.join("broken.wasm"), b"\0asm?").unwrap();
@@ -1488,6 +2225,23 @@ fn a_heavy_filter_installs_once_the_user_agrees() {
     assert!(listed["plugins"].as_array().unwrap().iter().any(|p| p["id"] == id && p["budget"] == "heavy"));
     // A light plug-in's entry says nothing of budgets.
     assert!(install(&mut s, DESATURATE).get("budget").is_none());
+}
+
+/// A module that carries its manifest in a `vc_manifest` custom section is inspected and installed
+/// without any of its code running: its start function traps and its `vc_manifest` export loops.
+#[test]
+fn a_plugin_with_a_manifest_section_installs_without_running() {
+    let mut s = session();
+    let id = "test.engine.section";
+    let manifest = format!(r#"{{"id":"{id}","name":"Test {id}","version":"1","kind":"filter","abi":1}}"#);
+    let extra = r#"(func (export "vc_manifest") (result i64) (loop $l (br $l)) (i64.const 0)) (func $trap unreachable) (start $trap)"#;
+    let data = vectorcraft_format::base64_encode(&wat::parse_str(tpl::sectioned(&manifest, tpl::ECHO, extra, 1)).unwrap());
+    let inspected = run(&mut s, "plugin.inspect", json!({"dataBase64": data}));
+    assert_eq!(inspected["id"], id);
+    assert!(vectorcraft_plugins::registry::get(id).is_none(), "inspecting installs nothing");
+    assert_eq!(run(&mut s, "plugin.install", json!({"dataBase64": data}))["id"], id);
+    assert!(vectorcraft_plugins::registry::get(id).is_some());
+    run(&mut s, "plugin.remove", json!({"id": id}));
 }
 
 #[test]
@@ -2604,6 +3358,380 @@ fn a_failed_store_write_keeps_the_stored_module_with_its_grant() {
     vectorcraft_plugins::registry::revoke(id);
 }
 
+/// An install refused because another session revoked the grant its checks relied on writes
+/// nothing: a store that kept the grant and lost the module gets no module back, its grants stay as
+/// they were, and the plug-in installed with the id and the other session's revoke stand. `grant`
+/// approves the module by itself.
+#[test]
+fn a_grant_revoked_while_installing_leaves_the_store_as_it_was() {
+    use vectorcraft_plugins::permissions::sha256_hex;
+    use vectorcraft_plugins::registry;
+    let folder = crate::tests_links::Folder::new("plugin-store-revoked-while-installing");
+    let id = "test.engine.permissions.revokedwhileinstalling";
+    let bytes = asking(id, r#"["doc.read"]"#, &json!({"objects": []}));
+    let data = vectorcraft_format::base64_encode(&bytes);
+    let mut s = session();
+    s.attach_plugin_store(folder.0.clone());
+    run(&mut s, "plugin.install", json!({"dataBase64": data, "grant": ["doc.read"]}));
+    let grants = folder.0.join("grants.json");
+    let recorded = std::fs::read(&grants).unwrap();
+    let module = std::path::PathBuf::from(s.stored_plugin_file(id).unwrap());
+    std::fs::remove_file(&module).unwrap();
+
+    crate::cmd::plugin::BEFORE_INSTALL.set(Some(Box::new(move || {
+        registry::revoke(id);
+    })));
+    let e = s.execute("plugin.install", &json!({"dataBase64": data})).unwrap_err().to_string();
+    assert!(e.contains("asks for the permissions doc.read"), "{e}");
+    assert!(!module.exists(), "no module is stored");
+    assert_eq!(std::fs::read(&grants).unwrap(), recorded, "the grants stay as they were");
+    assert!(registry::granted(id).is_none(), "the other session's revoke stands");
+    assert_eq!(registry::get(id).map(|p| p.hash().to_string()), Some(sha256_hex(&bytes)), "the installed plug-in stays");
+
+    crate::cmd::plugin::BEFORE_INSTALL.set(Some(Box::new(move || {
+        registry::revoke(id);
+    })));
+    run(&mut s, "plugin.install", json!({"dataBase64": data, "grant": ["doc.read"]}));
+    assert_eq!(std::fs::read(&module).unwrap(), bytes, "a module `grant` approves is stored");
+    assert!(registry::granted(id).is_some_and(|g| g.hash == sha256_hex(&bytes)));
+    run(&mut s, "plugin.remove", json!({"id": id}));
+}
+
+/// A plug-in another session installs with the id while a module is checked takes the place the
+/// checks found free. Without `replace`, or with `replace: false`, the install is refused, writes no
+/// module and leaves that plug-in installed; with `replace: true` the module takes its place.
+#[test]
+fn a_plug_in_installed_while_installing_needs_replace() {
+    use vectorcraft_plugins::permissions::sha256_hex;
+    use vectorcraft_plugins::registry;
+    let folder = crate::tests_links::Folder::new("plugin-store-installed-while-installing");
+    let id = "test.engine.installedwhileinstalling";
+    let ours = asking(id, "[]", &json!({"objects": []}));
+    let theirs = asking(id, "[]", &json!({"objects": [], "documentData": null}));
+    let data = vectorcraft_format::base64_encode(&ours);
+    let mut s = session();
+    s.attach_plugin_store(folder.0.clone());
+    let module = std::path::PathBuf::from(s.stored_plugin_file(id).unwrap());
+    let installed = || registry::get(id).map(|p| p.hash().to_string());
+    let meanwhile = |theirs: Vec<u8>| -> Option<Box<dyn FnOnce()>> {
+        Some(Box::new(move || {
+            registry::install_bytes(&theirs).unwrap();
+        }))
+    };
+
+    for (replace, why) in [(Value::Null, "is another module than"), (json!(false), "is already installed")] {
+        crate::cmd::plugin::BEFORE_INSTALL.set(meanwhile(theirs.clone()));
+        let e = s.execute("plugin.install", &json!({"dataBase64": data, "replace": replace})).unwrap_err().to_string();
+        assert!(e.contains(why), "{replace}: {e}");
+        assert!(!module.exists(), "{replace}: no module is stored");
+        assert_eq!(installed(), Some(sha256_hex(&theirs)), "{replace}: the other plug-in stays installed");
+        registry::remove(id);
+    }
+
+    crate::cmd::plugin::BEFORE_INSTALL.set(meanwhile(theirs));
+    run(&mut s, "plugin.install", json!({"dataBase64": data, "replace": true}));
+    assert_eq!(std::fs::read(&module).unwrap(), ours);
+    assert_eq!(installed(), Some(sha256_hex(&ours)));
+    run(&mut s, "plugin.remove", json!({"id": id}));
+}
+
+/// Without a plug-in store, the install's approval comes from the grant it read first, the one it
+/// checks again before it installs: a grant another session records after that read approves
+/// nothing, so a revoke that follows it can't be undone by the install recording it again.
+#[test]
+fn a_grant_recorded_and_revoked_while_installing_approves_nothing() {
+    use vectorcraft_plugins::permissions::{Grant, GrantToken, Permission, sha256_hex};
+    use vectorcraft_plugins::registry;
+    let id = "test.engine.permissions.recordedwhileinstalling";
+    let bytes = asking(id, r#"["doc.read"]"#, &json!({"objects": []}));
+    let data = vectorcraft_format::base64_encode(&bytes);
+    let mut s = session();
+    let g = Grant { id: id.into(), hash: sha256_hex(&bytes), permissions: vec![Permission::DocRead] };
+    crate::cmd::plugin::AFTER_GRANT_READ.set(Some(Box::new(move || {
+        registry::grant(GrantToken::after_engine_approval(g));
+    })));
+    let e = s.execute("plugin.install", &json!({"dataBase64": data})).unwrap_err().to_string();
+    assert!(e.contains("asks for the permissions doc.read"), "{e}");
+    assert!(registry::get(id).is_none(), "nothing is installed");
+    registry::revoke(id);
+}
+
+/// A `plugin.remove` in another session while a module is installed waits until the install has
+/// written the store, then removes the module, its grant and the plug-in: nothing of it stays in
+/// the store for the next launch.
+#[test]
+fn a_removal_while_installing_leaves_nothing_in_the_store() {
+    use vectorcraft_plugins::registry;
+    let folder = crate::tests_links::Folder::new("plugin-store-removed-while-installing");
+    let id = "test.engine.permissions.removedwhileinstalling";
+    let bytes = asking(id, r#"["doc.read"]"#, &json!({"objects": []}));
+    let data = vectorcraft_format::base64_encode(&bytes);
+    let mut s = session();
+    s.attach_plugin_store(folder.0.clone());
+    let module = std::path::PathBuf::from(s.stored_plugin_file(id).unwrap());
+    let grants = folder.0.join("grants.json");
+
+    let (said, heard) = std::sync::mpsc::channel::<&'static str>();
+    let (handed, remover) = std::sync::mpsc::channel();
+    let dir = folder.0.clone();
+    crate::cmd::plugin::BEFORE_STORE.set(Some(Box::new(move || {
+        let thread = std::thread::spawn(move || {
+            let tell = said.clone();
+            crate::cmd::plugin::WHILE_WAITING.set(Some(Box::new(move || {
+                let _ = tell.send("waiting");
+            })));
+            let mut other = session();
+            other.attach_plugin_store(dir);
+            let removed = other.execute("plugin.remove", &json!({"id": id})).map(|_| ()).map_err(|e| e.to_string());
+            let _ = said.send("removed");
+            removed
+        });
+        // The removal has finished, or waits for this install.
+        let first = heard.recv().unwrap_or("gone");
+        let _ = handed.send((first, thread));
+    })));
+    run(&mut s, "plugin.install", json!({"dataBase64": data, "grant": ["doc.read"]}));
+    let (first, thread) = remover.recv().unwrap();
+    assert_eq!(thread.join().unwrap(), Ok(()));
+    assert!(registry::get(id).is_none() && registry::granted(id).is_none(), "the plug-in and its grant are gone");
+    assert!(!module.exists(), "no module stays in the store");
+    assert!(!std::fs::read_to_string(&grants).is_ok_and(|g| g.contains(id)), "no grant stays in the store");
+    assert_eq!(first, "waiting", "the removal waits for the install");
+}
+
+/// Another session that attaches the plug-in store while a new version is installed loads the
+/// stored plug-ins once the install has written the store: the version that runs is the one the
+/// store keeps for the next launch.
+#[test]
+fn a_store_loaded_while_installing_loads_the_new_version() {
+    use vectorcraft_plugins::permissions::sha256_hex;
+    use vectorcraft_plugins::registry;
+    let folder = crate::tests_links::Folder::new("plugin-store-loaded-while-installing");
+    let id = "test.engine.permissions.loadedwhileinstalling";
+    let old = asking(id, r#"["doc.read"]"#, &json!({"objects": []}));
+    let new = asking(id, r#"["doc.read"]"#, &json!({"objects": [], "documentData": null}));
+    let mut s = session();
+    s.attach_plugin_store(folder.0.clone());
+    run(&mut s, "plugin.install", json!({"dataBase64": vectorcraft_format::base64_encode(&old), "grant": ["doc.read"]}));
+
+    let (said, heard) = std::sync::mpsc::channel::<&'static str>();
+    let (handed, loader) = std::sync::mpsc::channel();
+    let dir = folder.0.clone();
+    crate::cmd::plugin::BEFORE_STORE.set(Some(Box::new(move || {
+        let thread = std::thread::spawn(move || {
+            let tell = said.clone();
+            crate::cmd::plugin::WHILE_WAITING.set(Some(Box::new(move || {
+                let _ = tell.send("waiting");
+            })));
+            session().attach_plugin_store(dir);
+            let _ = said.send("loaded");
+        });
+        // The load has finished, or waits for this install.
+        let first = heard.recv().unwrap_or("gone");
+        let _ = handed.send((first, thread));
+    })));
+    let data = vectorcraft_format::base64_encode(&new);
+    run(&mut s, "plugin.install", json!({"dataBase64": data, "grant": ["doc.read"], "replace": true}));
+    let (first, thread) = loader.recv().unwrap();
+    thread.join().unwrap();
+    assert_eq!(registry::get(id).map(|p| p.hash().to_string()), Some(sha256_hex(&new)), "the new version runs");
+    assert_eq!(std::fs::read(s.stored_plugin_file(id).unwrap()).unwrap(), new, "the store keeps the new version");
+    assert_eq!(first, "waiting", "the load waits for the install");
+    run(&mut s, "plugin.remove", json!({"id": id}));
+}
+
+/// A grant of `doc.read` to plug-in `id`, the module with the SHA-256 `hash`.
+fn doc_read_grant(id: &str, hash: &str) -> vectorcraft_plugins::permissions::Grant {
+    serde_json::from_value(json!({"id": id, "hash": hash, "permissions": ["doc.read"]})).unwrap()
+}
+
+/// A session that uses the plug-in store `dir` without loading it, as another process using the
+/// same folder does: it doesn't wait for the installs and removals of this process's sessions.
+fn other_process(dir: std::path::PathBuf) -> Session {
+    let mut s = Session::new();
+    s.plugin_dir = Some(dir);
+    s
+}
+
+/// Waits on this thread for a turn on a plug-in store, telling `waiting` before it waits.
+fn tell_when_waiting(waiting: std::sync::mpsc::Sender<&'static str>) {
+    crate::store::WHILE_STORE_LOCKED.set(Some(Box::new(move || {
+        let _ = waiting.send("waiting");
+    })));
+}
+
+/// The ids `grants.json` in `dir` holds grants for, and the hash of each.
+fn stored_grant_hashes(dir: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let entries: Vec<Value> = serde_json::from_slice(&std::fs::read(dir.join("grants.json")).unwrap()).unwrap();
+    entries.iter().map(|e| (e["id"].as_str().unwrap().to_string(), e["hash"].as_str().unwrap().to_string())).collect()
+}
+
+/// An install into a `Plug-ins` folder that another process also installs the same id into keeps a
+/// module with its own grant: the other process's install waits for this one's turn on the folder,
+/// between this install's module and its grant, and then writes both of its own.
+#[test]
+fn installs_from_two_processes_into_one_store_keep_each_module_with_its_grant() {
+    use vectorcraft_plugins::permissions::sha256_hex;
+    let folder = crate::tests_links::Folder::new("plugin-store-installs-take-turns");
+    let id = "test.engine.permissions.installsturns";
+    let ours = asking(id, r#"["doc.read"]"#, &json!({"objects": []}));
+    let theirs = asking(id, r#"["doc.read"]"#, &json!({"objects": [], "documentData": null}));
+    let mut s = session();
+    s.attach_plugin_store(folder.0.clone());
+
+    let (said, heard) = std::sync::mpsc::channel::<&'static str>();
+    let (handed, other) = std::sync::mpsc::channel();
+    let (dir, module) = (folder.0.clone(), theirs.clone());
+    crate::cmd::plugin::BEFORE_GRANT_STORED.set(Some(Box::new(move || {
+        let thread = std::thread::spawn(move || {
+            tell_when_waiting(said.clone());
+            let other = other_process(dir);
+            let turn = other.plugin_store_turn().unwrap();
+            let stored = crate::cmd::plugin::keep_installed(&other, &turn, id, &module, Some(doc_read_grant(id, &sha256_hex(&module))));
+            let _ = said.send(if stored { "stored" } else { "not stored" });
+        });
+        // The other install has written the store, or waits for this one.
+        let first = heard.recv().unwrap_or("gone");
+        let _ = handed.send((first, thread));
+    })));
+    run(&mut s, "plugin.install", json!({"dataBase64": vectorcraft_format::base64_encode(&ours), "grant": ["doc.read"]}));
+    let (first, thread) = other.recv().unwrap();
+    thread.join().unwrap();
+
+    let module = std::fs::read(s.stored_plugin_file(id).unwrap()).unwrap();
+    assert_eq!(stored_grant_hashes(&folder.0).get(id), Some(&sha256_hex(&module)), "the stored grant covers the stored module");
+    assert_eq!(module, theirs, "the install that waited wrote last");
+    assert_eq!(first, "waiting", "the other install waits for this one");
+    run(&mut s, "plugin.remove", json!({"id": id}));
+}
+
+/// Grants written for two plug-ins into one `Plug-ins` folder by two processes are both kept: the
+/// second write reads `grants.json` only once the first has written it.
+#[test]
+fn grants_written_by_two_processes_into_one_store_keep_both() {
+    let folder = crate::tests_links::Folder::new("plugin-store-grants-take-turns");
+    let (ours, theirs) = ("test.engine.permissions.grantturnsa", "test.engine.permissions.grantturnsb");
+    let hash = vectorcraft_plugins::permissions::sha256_hex(b"module");
+    let s = other_process(folder.0.clone());
+
+    let (said, heard) = std::sync::mpsc::channel::<&'static str>();
+    let (handed, other) = std::sync::mpsc::channel();
+    let (dir, other_hash) = (folder.0.clone(), hash.clone());
+    crate::store::AFTER_GRANTS_READ.set(Some(Box::new(move || {
+        let thread = std::thread::spawn(move || {
+            tell_when_waiting(said.clone());
+            let written = other_process(dir).store_grant(theirs, Some(doc_read_grant(theirs, &other_hash)));
+            let _ = said.send(if written { "written" } else { "not written" });
+        });
+        // The other write has written the file, or waits for this one.
+        let first = heard.recv().unwrap_or("gone");
+        let _ = handed.send((first, thread));
+    })));
+    assert!(s.store_grant(ours, Some(doc_read_grant(ours, &hash))), "the grant is written");
+    let (first, thread) = other.recv().unwrap();
+    thread.join().unwrap();
+
+    let kept = stored_grant_hashes(&folder.0);
+    assert_eq!(kept.keys().map(String::as_str).collect::<Vec<_>>(), [ours, theirs], "both grants are kept");
+    assert_eq!(first, "waiting", "the other write waits for this one");
+}
+
+/// A setting a plug-in changes in one process and another setting it changes in a second process
+/// using the same `Plug-ins` folder are both kept: the second process waits for the first's turn on
+/// the folder and reads what it wrote. The second process is this test run again with
+/// `VECTORCRAFT_TEST_PLUGIN_SETTINGS_STORE` naming the folder; it prints when it waits and when it
+/// is done.
+#[test]
+fn settings_changed_by_two_processes_keep_both() {
+    use std::io::{BufRead, Write};
+    use vectorcraft_plugins::storage::Meter;
+    const CHILD: &str = "VECTORCRAFT_TEST_PLUGIN_SETTINGS_STORE";
+    const NAME: &str = "tests::plugins::settings_changed_by_two_processes_keep_both";
+    let id = "test.engine.storagetwoprocesses";
+    // Nothing a removal kept is moved back, so the storage is made without a turn on the folder.
+    let attached = |s: &Session| {
+        s.attach_plugin_storage(&crate::store::StoreTurn::unheld(), id);
+        vectorcraft_plugins::registry::storage(id).unwrap()
+    };
+    if let Some(dir) = std::env::var_os(CHILD) {
+        let st = attached(&other_process(std::path::PathBuf::from(dir)));
+        crate::store::WHILE_STORE_LOCKED.set(Some(Box::new(|| {
+            println!("settings-child-waiting");
+            let _ = std::io::stdout().flush();
+        })));
+        st.set_setting("theirs", b"2", &mut Meter::unlimited()).unwrap();
+        println!("settings-child-done");
+        let _ = std::io::stdout().flush();
+        return;
+    }
+    let folder = crate::tests_links::Folder::new("plugin-settings-two-processes");
+    let st = attached(&other_process(folder.0.clone()));
+
+    let (handed, child) = std::sync::mpsc::channel();
+    let dir = folder.0.clone();
+    crate::store::AFTER_SETTINGS_READ.set(Some(Box::new(move || {
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, &dir)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(process.stdout.take().unwrap()).lines();
+        // The other process has written the settings, or waits for this change.
+        let first = lines
+            .by_ref()
+            .map_while(std::io::Result::ok)
+            .find_map(|l| ["waiting", "done"].into_iter().find(|said| l.contains(&format!("settings-child-{said}"))));
+        let _ = handed.send((first, process, lines));
+    })));
+    st.set_setting("ours", b"1", &mut Meter::unlimited()).unwrap();
+    let (first, mut process, lines) = child.recv().unwrap();
+    let rest: Vec<String> = lines.map_while(std::io::Result::ok).collect();
+    assert!(process.wait().unwrap().success(), "the other process failed: {rest:?}");
+
+    let file: std::collections::BTreeMap<String, String> =
+        serde_json::from_slice(&std::fs::read(crate::store::plugin_data_dir(&folder.0, id).join("settings.json")).unwrap()).unwrap();
+    assert_eq!(file.keys().map(String::as_str).collect::<Vec<_>>(), ["ours", "theirs"], "both settings are kept");
+    assert_eq!(first, Some("waiting"), "the other process waits for this change");
+    vectorcraft_plugins::registry::set_storage(id, None);
+}
+
+/// When the `Plug-ins` folder can't be locked (here `disabled.lock` is a folder), `plugin.install`
+/// and `plugin.remove` change nothing and say why: the plug-in installed with the id, its grant and
+/// the stored module stay as they were.
+#[test]
+fn a_store_that_cant_be_locked_refuses_installs_and_removals() {
+    use vectorcraft_plugins::{permissions::sha256_hex, registry};
+    let folder = crate::tests_links::Folder::new("plugin-store-not-locked");
+    let id = "test.engine.permissions.notlocked";
+    let first = asking(id, r#"["doc.read"]"#, &json!({"objects": []}));
+    let second = asking(id, r#"["doc.read"]"#, &json!({"objects": [], "documentData": null}));
+    let mut s = session();
+    s.attach_plugin_store(folder.0.clone());
+    run(&mut s, "plugin.install", json!({"dataBase64": vectorcraft_format::base64_encode(&first), "grant": ["doc.read"]}));
+    let lock = folder.0.join(crate::store::DISABLED_LOCK);
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    let grants = std::fs::read(folder.0.join("grants.json")).unwrap();
+
+    let update = json!({"dataBase64": vectorcraft_format::base64_encode(&second), "grant": ["doc.read"], "replace": true});
+    let refused = s.execute("plugin.install", &update).unwrap_err().to_string();
+    assert!(refused.contains(crate::store::STORE_NOT_LOCKED) && refused.contains("nothing was installed"), "{refused}");
+    assert_eq!(registry::get(id).map(|p| p.hash().to_string()), Some(sha256_hex(&first)), "the installed plug-in stays");
+    assert_eq!(registry::granted(id).map(|g| g.hash), Some(sha256_hex(&first)), "its grant stays");
+    assert_eq!(std::fs::read(s.stored_plugin_file(id).unwrap()).unwrap(), first, "the store keeps its module");
+    assert_eq!(std::fs::read(folder.0.join("grants.json")).unwrap(), grants, "and its grant");
+
+    let refused = s.execute("plugin.remove", &json!({"id": id})).unwrap_err().to_string();
+    assert!(refused.contains(crate::store::STORE_NOT_LOCKED) && refused.contains("nothing was removed"), "{refused}");
+    assert!(registry::get(id).is_some(), "the plug-in stays installed");
+    assert!(std::path::Path::new(&s.stored_plugin_file(id).unwrap()).exists(), "and stored");
+
+    std::fs::remove_dir(&lock).unwrap();
+    run(&mut s, "plugin.remove", json!({"id": id}));
+    assert!(registry::get(id).is_none());
+}
+
 /// Runs the test `name` of this module again in a process of its own → whether this is that
 /// process. The list of disabled plug-ins is kept for the whole process, and the other tests here
 /// read it again each time they attach a plug-in store.
@@ -3070,7 +4198,7 @@ fn granted_permissions_are_kept_and_folders_skip_the_rest() {
     let mut third = session();
     third.attach_plugin_store(folder.0.clone());
     assert!(vectorcraft_plugins::registry::get(id).is_none(), "nobody granted it");
-    assert_eq!(std::fs::read_dir(&folder.0).unwrap().count(), 1, "the module stays in the store");
+    assert_eq!(store_files(&folder.0), 1, "the module stays in the store");
 
     // The Additional Plug-ins Folder skips it with a note until it is granted.
     let dir = crate::tests_links::Folder::new("plugin-folder-grants");
@@ -3545,6 +4673,59 @@ fn a_cancelled_filter_run_changes_nothing() {
     assert_eq!(s.doc().unwrap().doc, before);
 }
 
+/// Preferences › Plug-ins & Scratch Disks › Plug-in Instruction Budget: with Normal a light filter
+/// runs out of instructions and changes nothing; with Large the same installed filter finishes, as
+/// one undo step, without being installed again. The time budget, Cancel and a heavy filter's
+/// larger budget stay as they are, and setting Normal again applies to the next run.
+#[test]
+fn the_plugin_instruction_budget_preference_sets_a_filter_run_s_instructions() {
+    use cmd::plugin::FilterRun;
+    let mut s = session();
+    let id = "test.engine.largebudget";
+    let output = json!({"objects": [{"path": triangle(), "name": "Plug-in"}]}).to_string();
+    // More steps than a light budget pays for, fewer than 5 times it.
+    install_wat(&mut s, &tpl::spinning(&tpl::manifest(id, "filter", "{}"), 20_000_000, &output));
+    let p = json!({"id": id, "ids": []});
+    let (before, undo) = (s.doc().unwrap().doc.clone(), s.doc().unwrap().history.undo.len());
+    let e = s.execute("plugin.run", &p).unwrap_err().to_string();
+    assert!(e.contains("instruction budget"), "{e}");
+    assert_eq!((&s.doc().unwrap().doc, s.doc().unwrap().history.undo.len()), (&before, undo));
+
+    run(&mut s, "prefs.set", json!({"key": "pluginInstructionBudget", "value": "large"}));
+    let light = vectorcraft_plugins::Limits::default();
+    let large = FilterRun::prepare(&s, &p).unwrap().limits().clone();
+    assert_eq!(large, vectorcraft_plugins::Limits { fuel_base: vectorcraft_plugins::LARGE_FUEL, ..light.clone() });
+    assert_eq!((large.fuel_per_byte, large.wall_time_ms), (light.fuel_per_byte, light.wall_time_ms));
+    // Cancel still stops it, and it changes nothing.
+    let token = vectorcraft_doc::cancel::CancelToken::new();
+    token.cancel();
+    let r = vectorcraft_doc::cancel::scope(&token, None, || s.execute("plugin.run", &p));
+    assert!(matches!(r, Err(EngineError::Cancelled)), "{r:?}");
+    assert_eq!((&s.doc().unwrap().doc, s.doc().unwrap().history.undo.len()), (&before, undo));
+    let made = run(&mut s, "plugin.run", p.clone())["ids"].clone();
+    assert_eq!(made.as_array().map(Vec::len), Some(1));
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo + 1);
+
+    // A heavy filter keeps its larger budget with either choice.
+    let heavy_id = "test.engine.largebudget.heavy";
+    run(&mut s, "plugin.install", json!({"dataBase64": vectorcraft_format::base64_encode(&heavy(heavy_id, 1)), "allowHeavy": true}));
+    let hp = json!({"id": heavy_id, "ids": []});
+    for budget in ["large", "normal"] {
+        run(&mut s, "prefs.set", json!({"key": "pluginInstructionBudget", "value": budget}));
+        let limits = FilterRun::prepare(&s, &hp).unwrap().limits().clone();
+        let heavy_limits = (vectorcraft_plugins::HEAVY_FUEL, vectorcraft_plugins::HEAVY_WALL_TIME_MS);
+        assert_eq!((limits.fuel_base, limits.wall_time_ms), heavy_limits, "{budget}");
+    }
+
+    // Normal again: the next run runs out of instructions.
+    let undo = s.doc().unwrap().history.undo.len();
+    let e = s.execute("plugin.run", &p).unwrap_err().to_string();
+    assert!(e.contains("instruction budget"), "{e}");
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo);
+    run(&mut s, "plugin.remove", json!({"id": id}));
+    run(&mut s, "plugin.remove", json!({"id": heavy_id}));
+}
+
 /// The manifest of a filter `id` named "Cmd Test" of `kind` with `commands` (a JSON list).
 fn with_commands(id: &str, kind: &str, commands: &str) -> String {
     format!(r#"{{"id":"{id}","name":"Cmd Test","version":"1","kind":"{kind}","commands":{commands}}}"#)
@@ -3610,10 +4791,87 @@ fn plugin_commands_are_registered_run_and_removed() {
     install_wat(&mut s, &tpl::module(&tpl::manifest(id, "filter", "{}"), tpl::ECHO, "", 1));
     assert!(listed(&s, grow).is_none() && crate::cmd::find_command(grow).is_none());
     install_wat(&mut s, &grower(id));
-    assert!(listed(&s, grow).is_some());
+    assert!(listed(&s, grow).is_some() && crate::cmd::find_command(grow).is_some());
     run(&mut s, "plugin.remove", json!({"id": id}));
     assert!(listed(&s, grow).is_none() && listed(&s, tidy).is_none());
+    assert!(crate::cmd::find_command(grow).is_none() && crate::cmd::find_command(tidy).is_none());
     assert!(s.execute(grow, &json!({})).is_err(), "removed, it no longer runs");
+}
+
+/// At API level 2 a command's `menu` lists it in that menu with its plug-in's name after its
+/// label, and `plugin.list` gives its `menu` with `after` escaped. A command whose label reads like
+/// a built-in command of that menu, or like a command a plug-in with a lower id places there,
+/// stays in its plug-in's submenu, and `plugin.list` marks it `placed: false`. Replaced by a module
+/// whose command has no `menu`, a command is back in its submenu.
+#[test]
+fn placed_plugin_commands_are_listed_in_their_menu() {
+    let mut s = session();
+    let placing = |id: &str, name: &str, commands: &str| {
+        let manifest = format!(r#"{{"id":"{id}","name":"{name}","api":2,"version":"1","kind":"filter","commands":{commands}}}"#);
+        tpl::returning(&manifest, r#"{"objects":[]}"#)
+    };
+    let (ant, bee, cat) = ("test.engine.place.ant", "test.engine.place.bee", "test.engine.place.cat");
+    let low = |id: &str| crate::cmd::plugin::command_id(id, "low");
+    let menu_of = |s: &Session, command: &str| listed(s, command).map(|c| c.menu.iter().map(|m| m.to_string()).collect::<Vec<_>>());
+    let in_select = json!([{"id": "low", "label": "Low Area", "menu": {"path": ["Select"], "after": "\u{202E}Inverse"}}]).to_string();
+    let in_select = in_select.as_str();
+
+    let info = install_wat(&mut s, &placing(ant, "Tidy", in_select));
+    let menu = &info["commands"][0]["menu"];
+    assert_eq!(menu["path"], json!(["Select"]));
+    assert!(menu["after"].as_str().is_some_and(|a| a.ends_with("Inverse") && !a.contains('\u{202E}')), "escaped: {menu}");
+    assert!(menu.get("placed").is_none(), "{menu}");
+    let c = listed(&s, &low(ant)).expect("listed");
+    assert_eq!((c.label, menu_of(&s, &low(ant))), ("Low Area (Tidy)", Some(vec!["Select".to_string()])));
+
+    // Another plug-in of the same name placing the same label at the same spot stays in its submenu.
+    let info = install_wat(&mut s, &placing(bee, "Tidy", in_select));
+    assert_eq!(info["commands"][0]["menu"]["placed"], json!(false));
+    assert_eq!(listed(&s, &low(bee)).map(|c| c.label), Some("Low Area"));
+    assert_eq!(menu_of(&s, &low(bee)), Some(vec!["Object".into(), "Plug-ins".into(), "Tidy".into()]));
+    assert_eq!(menu_of(&s, &low(ant)), Some(vec!["Select".to_string()]));
+
+    // `Paste (in Place)` reads like Edit's Paste in Place; Keep is placed.
+    let edit = r#"[{"id":"paste","label":"Paste","menu":{"path":["Edit"]}},{"id":"keep","label":"Keep","menu":{"path":["Edit"]}}]"#;
+    let info = install_wat(&mut s, &placing(cat, "in Place", edit));
+    assert_eq!(info["commands"][0]["menu"]["placed"], json!(false));
+    assert!(info["commands"][1]["menu"].get("placed").is_none());
+    let paste = crate::cmd::plugin::command_id(cat, "paste");
+    assert_eq!(menu_of(&s, &paste), Some(vec!["Object".into(), "Plug-ins".into(), "in Place".into()]));
+    assert_eq!(menu_of(&s, &crate::cmd::plugin::command_id(cat, "keep")), Some(vec!["Edit".to_string()]));
+    // `Stop Global (Edit)` reads like the other label of Select's Start Global Edit.
+    let dog = "test.engine.place.dog";
+    let info = install_wat(&mut s, &placing(dog, "Edit", r#"[{"id":"stop","label":"Stop Global","menu":{"path":["Select"]}}]"#));
+    assert_eq!(info["commands"][0]["menu"]["placed"], json!(false));
+    run(&mut s, "plugin.remove", json!({"id": dog}));
+    // Object's Show All has one label, so `Hide (All)` is placed beside it.
+    let all = "test.engine.place.all";
+    let info = install_wat(&mut s, &placing(all, "All", r#"[{"id":"hide","label":"Hide","menu":{"path":["Object"]}}]"#));
+    assert!(info["commands"][0]["menu"].get("placed").is_none(), "{}", info["commands"][0]);
+    assert_eq!(menu_of(&s, &crate::cmd::plugin::command_id(all, "hide")), Some(vec!["Object".to_string()]));
+    run(&mut s, "plugin.remove", json!({"id": all}));
+    // `Hide (Edges)` reads like the desktop app's View › Hide Edges, with or without the desktop app.
+    let edges = "test.engine.place.edges";
+    let info = install_wat(&mut s, &placing(edges, "Edges", r#"[{"id":"hide","label":"Hide","menu":{"path":["View"]}}]"#));
+    assert_eq!(info["commands"][0]["menu"]["placed"], json!(false));
+    run(&mut s, "plugin.remove", json!({"id": edges}));
+    // Inspecting a plug-in that is not installed reports what installing it gives: of two commands
+    // with one label at one spot, the second stays in its submenu.
+    let twice = r#"[{"id":"a","label":"Low","menu":{"path":["Select"]}},{"id":"b","label":"Low","menu":{"path":["Select"]}}]"#;
+    let data = vectorcraft_format::base64_encode(&wat::parse_str(placing("test.engine.place.eel", "Eel", twice)).unwrap());
+    let inspected = run(&mut s, "plugin.inspect", json!({"dataBase64": data}));
+    assert!(inspected["commands"][0]["menu"].get("placed").is_none(), "{inspected}");
+    assert_eq!(inspected["commands"][1]["menu"]["placed"], json!(false), "{inspected}");
+
+    // Replaced by a module whose command has no `menu`, Ant's command is back in its submenu and
+    // Bee's takes the spot.
+    install_wat(&mut s, &placing(ant, "Tidy", r#"[{"id":"low","label":"Low Area"}]"#));
+    assert_eq!(menu_of(&s, &low(ant)), Some(vec!["Object".into(), "Plug-ins".into(), "Tidy".into()]));
+    assert_eq!(menu_of(&s, &low(bee)), Some(vec!["Select".to_string()]));
+    for id in [ant, bee, cat] {
+        run(&mut s, "plugin.remove", json!({"id": id}));
+    }
+    assert!(listed(&s, &low(bee)).is_none());
 }
 
 /// A command run is journaled like any other, so an action records it with its parameters and
@@ -4008,7 +5266,7 @@ fn plugin_storage_is_capped_and_survives_a_damaged_settings_file() {
 
     // An id that differs only in case has storage of its own, which removing this one leaves.
     let upper_id = "test.engine.StorageCaps";
-    s.attach_plugin_storage(upper_id);
+    s.attach_plugin_storage(&s.plugin_store_turn().unwrap(), upper_id);
     let upper = vectorcraft_plugins::registry::storage(upper_id).unwrap();
     assert_eq!(upper.setting("k0", m).unwrap(), None);
     upper.set_setting("k0", b"upper", m).unwrap();
@@ -4020,13 +5278,13 @@ fn plugin_storage_is_capped_and_survives_a_damaged_settings_file() {
 
     // Removing the plug-in closes the storage a run still holds, even one from before the plug-in
     // was replaced, so nothing is written back.
-    s.attach_plugin_storage(id);
+    s.attach_plugin_storage(&s.plugin_store_turn().unwrap(), id);
     run(&mut s, "plugin.remove", json!({"id": id}));
     assert_eq!(st.set_setting("zoom", b"again", m), Err(StorageError::Unavailable));
     assert_eq!(st.set_cache_entry("tile", b"again", m), Err(StorageError::Unavailable));
     assert!(!dir.exists());
     assert_eq!(upper.setting("k0", m).unwrap(), Some(b"upper".to_vec()));
-    s.remove_plugin_storage(upper_id, || true).unwrap();
+    s.remove_plugin_storage(&s.plugin_store_turn().unwrap(), upper_id, || true).unwrap();
 }
 
 /// Files larger than the storage reads are not read: a settings file larger than 1 MiB, although
@@ -4204,12 +5462,12 @@ fn removing_a_plugin_drops_its_settings_from_memory() {
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(&file, &bytes).unwrap();
     set_modified(&file, written);
-    s.attach_plugin_storage(id);
+    s.attach_plugin_storage(&s.plugin_store_turn().unwrap(), id);
     let st = vectorcraft_plugins::registry::storage(id).unwrap();
     let mut m = Meter::unlimited();
     assert_eq!(st.setting("zoom", &mut m).unwrap(), Some(b"hello".to_vec()));
     assert_eq!(m.used(), bytes.len() as u64, "read from the file");
-    s.remove_plugin_storage(id, || true).unwrap();
+    s.remove_plugin_storage(&s.plugin_store_turn().unwrap(), id, || true).unwrap();
 }
 
 /// The cache's total stays in memory while the cache folder keeps its time; a write and a clear
@@ -4344,13 +5602,12 @@ fn deferred_move(s: &mut Session) -> NodeId {
     r
 }
 
-/// The rectangle a run named `label` during [`deferred_move`] left: moved, with the interaction
-/// ended and the move an undo step of its own before the run's.
-fn assert_moved_once(s: &Session, r: NodeId, label: &str) {
+/// The rectangle a run that hands back what it is given left during [`deferred_move`]: moved, with
+/// the interaction ended and the move the last undo step, since the run changed nothing.
+fn assert_moved_once(s: &Session, r: NodeId) {
     assert!(!s.in_interaction());
     assert_eq!(node(s, r).geometric_bounds().unwrap().x0, 17.0, "the filter was given the moved rectangle");
-    let labels: Vec<&str> = s.doc().unwrap().history.undo.iter().rev().take(2).map(|e| e.label.as_str()).collect();
-    assert_eq!(labels, [label, "Move"]);
+    assert_eq!(s.doc().unwrap().history.undo.last().map(|e| e.label.as_str()), Some("Move"));
 }
 
 /// With Real-time Drawing off, `plugin.run` of a filter that calls commands during a drag applies
@@ -4362,7 +5619,7 @@ fn a_filter_that_calls_commands_is_given_a_deferred_move() {
     install_echo_calling(&mut s, id, "[]");
     let r = deferred_move(&mut s);
     run(&mut s, "plugin.run", json!({"id": id}));
-    assert_moved_once(&s, r, &format!("Test {id}"));
+    assert_moved_once(&s, r);
     run(&mut s, "plugin.remove", json!({"id": id}));
 }
 
@@ -4375,6 +5632,6 @@ fn a_plugin_command_that_calls_commands_is_given_a_deferred_move() {
     install_echo_calling(&mut s, id, r#"[{"id":"same","label":"Same"}]"#);
     let r = deferred_move(&mut s);
     run(&mut s, &format!("plugin.{id}.same"), json!({}));
-    assert_moved_once(&s, r, "Same");
+    assert_moved_once(&s, r);
     run(&mut s, "plugin.remove", json!({"id": id}));
 }

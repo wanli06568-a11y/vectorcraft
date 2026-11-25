@@ -69,6 +69,77 @@ fn native_recovery_copies_leave_out_the_pdf() {
     assert_eq!(vectorcraft_format::load(&bytes).unwrap().node_count(), s.doc().unwrap().doc.node_count());
 }
 
+const RECOVERY_FONT_FAMILY: &str = "Recovery Carried Font Regression";
+const RECOVERY_FONT_BYTES: &[u8] = include_bytes!("../../../../assets/fonts/Inter-Regular.ttf");
+
+fn carried_font_copy() -> (Arc<MemoryStore>, vectorcraft_doc::NodeId) {
+    use vectorcraft_doc::{CharStyle, FILE_FONT_MIME, FileFont, FileFonts, ImageBlob, Node, NodeKind, TextObject};
+
+    let (mut s, store) = session();
+    let doc = Arc::make_mut(&mut s.doc_mut().unwrap().doc);
+    doc.images.insert("recovered-font".into(), ImageBlob::new(FILE_FONT_MIME, RECOVERY_FONT_BYTES.to_vec()));
+    // An uninstalled family ensures the fixture must be read from the recovered resource.
+    let style = CharStyle { font_family: RECOVERY_FONT_FAMILY.into(), size: 20.0, ..Default::default() };
+    let mut text = TextObject::point(kurbo::Point::new(10.0, 40.0), "x", style);
+    text.file_fonts = Some(Box::new(FileFonts::new(
+        vec![FileFont { family: RECOVERY_FONT_FAMILY.into(), style: "Regular".into(), key: "recovered-font".into() }],
+        "x",
+    )));
+    let id = doc.alloc_id();
+    doc.insert(Some(doc.layers[0].id), usize::MAX, Node::new(id, NodeKind::Text(Box::new(text)))).unwrap();
+    let saved = s.execute("file.recovery.save", &json!({})).unwrap();
+    let file = saved["saved"][0]["file"].as_str().unwrap();
+    let lean = vectorcraft_format::load(&store.read(&format!("{file}.vectorcraft")).unwrap()).unwrap();
+    assert!(lean.images.is_empty(), "the font travels in the recovery store, not the document entry");
+    drop(s);
+    (store, id)
+}
+
+#[test]
+fn recovered_carried_fonts_bind_after_their_resources_are_restored() {
+    use vectorcraft_doc::NodeKind;
+    use vectorcraft_text::FontDb;
+
+    let (store, id) = carried_font_copy();
+    let mut s = relaunch(&store);
+    let reply = s.execute("file.recovery.restore", &json!({})).unwrap();
+    assert_eq!(reply["restored"].as_array().unwrap().len(), 1, "{reply}");
+    assert!(reply["failed"].as_array().unwrap().is_empty(), "{reply}");
+    assert!(reply["restored"][0]["warnings"].as_array().unwrap().is_empty(), "{reply}");
+    let doc = &s.doc().unwrap().doc;
+    assert_eq!(doc.images["recovered-font"].bytes.as_slice(), RECOVERY_FONT_BYTES);
+    let NodeKind::Text(text) = &doc.node(id).unwrap().kind else { panic!("text") };
+    let db = FontDb::global();
+    let laid = vectorcraft_text::layout(db, text);
+    assert_eq!(laid.glyphs.len(), 1);
+    let face = db.face_by_id(laid.glyphs[0].font_id).unwrap();
+    assert_eq!(face.file_data(), RECOVERY_FONT_BYTES, "layout uses the recovered font's exact bytes");
+}
+
+#[test]
+fn recovered_missing_or_corrupt_carried_fonts_report_the_actual_refusal() {
+    for missing in [true, false] {
+        let (store, id) = carried_font_copy();
+        let blob = store.list().unwrap().into_iter().find(|name| name.ends_with(".blob")).unwrap();
+        if missing {
+            store.remove(&blob).unwrap();
+        } else {
+            store.write(&blob, b"not a font").unwrap();
+        }
+        let mut s = relaunch(&store);
+        let reply = s.execute("file.recovery.restore", &json!({})).unwrap();
+        assert_eq!(reply["restored"].as_array().unwrap().len(), 1, "{reply}");
+        assert!(reply["failed"].as_array().unwrap().is_empty(), "{reply}");
+        let warnings = reply["restored"][0]["warnings"].as_array().unwrap();
+        assert!(
+            warnings.iter().any(|note| note.as_str().is_some_and(|note| note.contains(RECOVERY_FONT_FAMILY) && note.contains("substitute"))),
+            "missing={missing}: {reply}"
+        );
+        let vectorcraft_doc::NodeKind::Text(text) = &s.doc().unwrap().doc.node(id).unwrap().kind else { panic!("text") };
+        assert!(vectorcraft_text::FontDb::global().file_faces(text).is_empty(), "missing={missing}");
+    }
+}
+
 #[test]
 fn restored_recovery_copies_keep_the_original_pdf_preference() {
     let dir = crate::tests_links::Folder::new("recovered-pdf-preference");
@@ -394,6 +465,23 @@ fn an_app_that_leaves_has_its_copies_offered_at_once() {
         assert_eq!(offered(&mut b), ["Untitled-1"]);
         assert_eq!(restored(b.execute("file.recovery.restore", &json!({})).unwrap()), 1);
     }
+}
+
+/// The folder copies go to: the `recoveryFolder` preference, trimmed, when it names one, else the
+/// folder the app sets; none with a store the host installed. The web build has no folders.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_folder_in_use_is_the_preference_or_the_apps() {
+    let mut s = Session::new();
+    assert_eq!(cmd::recovery::folder(&s), None);
+    s.recovery.set_default_folder(Some("/app/recovery".into()));
+    assert_eq!(cmd::recovery::folder(&s), Some(("/app/recovery".into(), false)));
+    s.prefs.recovery_folder = " \t ".into();
+    assert_eq!(cmd::recovery::folder(&s), Some(("/app/recovery".into(), false)));
+    s.prefs.recovery_folder = "  /chosen/copies ".into();
+    assert_eq!(cmd::recovery::folder(&s), Some(("/chosen/copies".into(), true)));
+    s.recovery.set_store(Arc::new(MemoryStore::default()));
+    assert_eq!(cmd::recovery::folder(&s), None);
 }
 
 #[test]
@@ -1179,6 +1267,31 @@ fn a_keeps_entry_in_a_running_apps_area_keeps_the_copies() {
     assert_eq!(offered(&mut b).len(), 2);
 }
 
+/// An entry `<area>/keeps-<left area>` in a crashed app's area keeps nothing while restore or
+/// discard holds that area: both crashed apps' copies are restored, and discarded.
+#[test]
+fn a_keeps_entry_in_a_crashed_apps_area_held_by_the_same_command_keeps_nothing() {
+    let crashed = |store: &Arc<MemoryStore>| {
+        let mut s = session_in(store);
+        s.execute("file.recovery.save", &json!({})).unwrap();
+        s.recovery.own_area().unwrap().to_string()
+    };
+    for cmd in ["file.recovery.restore", "file.recovery.discard"] {
+        let store = Arc::new(MemoryStore::default());
+        let a = crashed(&store);
+        let c = crashed(&store);
+        assert_ne!(a, c);
+        // The area that sorts first, which the command holds first, keeps the other one's copies.
+        let (first, second) = if a < c { (a, c) } else { (c, a) };
+        store.write(&format!("{first}/keeps-{second}"), b"").unwrap();
+        let mut b = relaunch(&store);
+        assert_eq!(offered(&mut b).len(), 2);
+        let r = b.execute(cmd, &json!({})).unwrap();
+        let done = if cmd == "file.recovery.restore" { restored(r) } else { r["discarded"].as_array().unwrap().len() };
+        assert_eq!(done, 2, "{cmd}");
+    }
+}
+
 /// An entry `<area>/keeps-<left area>` in a folder whose lock file can't be opened keeps nothing.
 #[cfg(unix)]
 #[test]
@@ -1490,6 +1603,47 @@ fn images_sharing_an_entry_are_written_once() {
     assert_eq!(store.images_written().len(), 1, "restored into this session's area once");
 }
 
+/// A linked image shown only in a stored brush's art is kept as its preview, as a save writes it;
+/// an image key that a brush's art embeds keeps its full bytes though the layers show it linked.
+#[test]
+fn recovery_brush_links_keep_proxy_and_embedded_full_bytes() {
+    let (full, proxy) = (vec![1u8; 40], vec![2u8; 10]);
+    for brush_linked in [true, false] {
+        let store = Arc::new(MemoryStore::default());
+        let mut s = session_in(&store);
+        {
+            let d = Arc::make_mut(&mut s.doc_mut().unwrap().doc);
+            let blob =
+                vectorcraft_doc::ImageBlob { proxy: Some(Arc::new(proxy.clone())), ..vectorcraft_doc::ImageBlob::new("image/jpeg", full.clone()) };
+            d.images.insert("k".into(), blob);
+            let image = |link: Option<vectorcraft_doc::LinkInfo>| {
+                let im = vectorcraft_doc::ImageObject {
+                    key: "k".into(),
+                    width: 4,
+                    height: 4,
+                    xf: vectorcraft_geom::Affine::IDENTITY,
+                    link,
+                    placement: Default::default(),
+                    pixels: None,
+                };
+                vectorcraft_doc::Node::new(NodeId(0), vectorcraft_doc::NodeKind::Image(Box::new(im)))
+            };
+            let link = Some(vectorcraft_doc::LinkInfo::new("/work/k.jpg"));
+            if !brush_linked {
+                let (mut n, layer) = (image(link.clone()), d.layers[0].id);
+                n.id = d.alloc_id();
+                d.insert(Some(layer), 0, n).unwrap();
+            }
+            let art = image(if brush_linked { link } else { None });
+            let scatter = vectorcraft_brush::Scatter { art, ..Default::default() };
+            vectorcraft_brush::store(d, &[vectorcraft_brush::Brush { name: "Dots".into(), kind: vectorcraft_brush::BrushKind::Scatter(scatter) }]);
+        }
+        let r = s.execute("file.recovery.save", &json!({})).unwrap();
+        let want = if brush_linked { proxy.len() } else { full.len() };
+        assert_eq!(r["saved"][0]["imageBytes"], want, "linked in the brush: {brush_linked}: {r}");
+    }
+}
+
 #[test]
 fn copies_from_before_images_were_kept_apart_still_restore() {
     let store = Arc::new(MemoryStore::default());
@@ -1545,6 +1699,71 @@ impl RecoveryStore for DiesAfterDocument {
     }
 }
 
+/// Under automation read roots, `file.recovery.save`, `file.recovery.list` and
+/// `file.recovery.restore` name a document's file and the recovery folder only inside them.
+#[test]
+fn recovery_replies_leave_out_paths_outside_the_read_root() {
+    use crate::file_access::{AutomationRoots, confine};
+    use serde_json::Value;
+    let base = crate::tests_links::Folder::new("recovery-read-root");
+    let (inside, outside) = (base.0.join("in"), base.0.join("out"));
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let store: Arc<dyn RecoveryStore> = Arc::new(FolderStore::new(outside.join("recovery")));
+    let location = outside.join("recovery").to_string_lossy().to_string();
+    let kept = inside.join("kept.vectorcraft").to_string_lossy().to_string();
+    let hidden = outside.join("hidden.vectorcraft").to_string_lossy().to_string();
+    let mut s = Session::new();
+    s.recovery.set_store(store.clone());
+    for path in [&kept, &hidden] {
+        s.execute("file.new", &json!({"width": 200, "height": 100})).unwrap();
+        s.execute("file.saveAs", &json!({"path": path})).unwrap();
+        s.execute("shape.rectangle", &json!({"x": 10, "y": 10, "width": 50, "height": 20})).unwrap();
+    }
+    let roots = AutomationRoots::new(&[&inside], &[]).unwrap();
+    let saved = confine(roots.as_ref(), || s.execute("file.recovery.save", &json!({}))).unwrap();
+    assert_eq!(saved["location"], Value::Null, "{saved}");
+    s.execute("shape.ellipse", &json!({"x": 80, "y": 20, "width": 20, "height": 20})).unwrap();
+    assert_eq!(s.execute("file.recovery.save", &json!({})).unwrap()["location"], json!(location), "the person sees the folder");
+
+    let sorted = |v: &Value, key: &str| -> Vec<String> {
+        let mut out: Vec<String> = v[key].as_array().unwrap().iter().map(|c| c["path"].to_string()).collect();
+        out.sort();
+        out
+    };
+    let both = |first: Value| {
+        let mut out = vec![first.to_string(), json!(kept).to_string()];
+        out.sort();
+        out
+    };
+    assert_eq!(sorted(&s.execute("file.recovery.list", &json!({})).unwrap(), "copies"), both(json!(hidden)));
+    let listed = confine(roots.as_ref(), || s.execute("file.recovery.list", &json!({}))).unwrap();
+    assert_eq!((sorted(&listed, "copies"), &listed["location"]), (both(Value::Null), &Value::Null), "{listed}");
+    let outside_text = json!(outside.to_string_lossy()).to_string();
+    assert!(!listed.to_string().contains(outside_text.trim_matches('"')), "no path outside the root: {listed}");
+    // A relative recovery folder is checked as the file system reads it; a store that is no folder
+    // keeps its name.
+    let mut relative = Session::new();
+    relative.recovery.set_store(Arc::new(FolderStore::new("vc-recovery-relative-folder")));
+    let l = confine(roots.as_ref(), || relative.execute("file.recovery.list", &json!({}))).unwrap();
+    assert_eq!(l["location"], Value::Null, "{l}");
+    let (mut memory, _) = session();
+    let l = confine(roots.as_ref(), || memory.execute("file.recovery.list", &json!({}))).unwrap();
+    assert_eq!(l["location"], "memory", "{l}");
+
+    // After a crash, the copies restored.
+    drop(s);
+    let mut s = Session::new();
+    s.recovery.set_store(store.clone());
+    let r = confine(roots.as_ref(), || s.execute("file.recovery.restore", &json!({}))).unwrap();
+    assert_eq!(sorted(&r, "restored"), both(Value::Null), "{r}");
+    let mut opened: Vec<Option<String>> = s.documents().iter().map(|d| d.path.clone()).collect();
+    opened.sort();
+    let mut files = vec![Some(hidden), Some(kept)];
+    files.sort();
+    assert_eq!(opened, files, "the documents keep their files");
+}
+
 /// A crash between writing a copy's document and its details restores the new document with
 /// every image, the one placed since the last copy too (and the first copy likewise).
 #[test]
@@ -1564,5 +1783,72 @@ fn a_crash_between_a_copys_document_and_its_details_keeps_every_image() {
         let mut s = relaunch(&store);
         assert_eq!(restored(s.execute("file.recovery.restore", &json!({})).unwrap()), 1, "first copy: {first}");
         assert_eq!(images_of(&s), images, "first copy: {first}");
+    }
+}
+
+/// A crash between writing a copy's document and its details, after a script's command changed
+/// the document since the last copy, restores the document as one a script opened.
+#[test]
+fn a_crash_between_a_copys_document_and_its_details_keeps_a_scripts_change() {
+    let store = Arc::new(MemoryStore::default());
+    let mut s = session_in(&store);
+    s.execute("file.recovery.save", &json!({})).unwrap();
+    let source = "vc.run('shape.ellipse', {x: 80, y: 20, width: 20, height: 20});";
+    s.execute("script.run", &json!({"source": source, "name": "t.js"})).unwrap();
+    assert!(s.doc().unwrap().by_script.is_some(), "the script's command changed the document");
+    let doc = vectorcraft_doc::Document::clone(&s.doc().unwrap().doc);
+    s.recovery.set_store(Arc::new(DiesAfterDocument { inner: store.clone(), dead: Default::default() }));
+    assert!(s.execute("file.recovery.save", &json!({})).is_err(), "the details weren't written");
+    drop(s);
+    let mut s = relaunch(&store);
+    assert_eq!(restored(s.execute("file.recovery.restore", &json!({})).unwrap()), 1);
+    let count = |d: &vectorcraft_doc::Document| d.layers.iter().map(|l| l.count()).sum::<usize>();
+    assert_eq!(count(&s.doc().unwrap().doc), count(&doc), "the new document is in");
+    assert!(s.doc().unwrap().by_script.is_some(), "restored as a document a script opened");
+}
+
+/// A crash while a restore moves a copy into the app's own area leaves no copy that a later
+/// restore opens without its details: a script's change is kept.
+#[test]
+fn a_crash_while_a_copy_is_restored_keeps_a_scripts_change() {
+    let store = Arc::new(MemoryStore::default());
+    let mut s = session_in(&store);
+    let source = "vc.run('shape.ellipse', {x: 80, y: 20, width: 20, height: 20});";
+    s.execute("script.run", &json!({"source": source, "name": "t.js"})).unwrap();
+    s.execute("file.recovery.save", &json!({})).unwrap();
+    drop(s);
+    let mut s = Session::new();
+    s.recovery.set_store(Arc::new(DiesAfterDocument { inner: store.clone(), dead: Default::default() }));
+    let _ = s.execute("file.recovery.restore", &json!({}));
+    drop(s);
+    let mut s = relaunch(&store);
+    assert!(restored(s.execute("file.recovery.restore", &json!({})).unwrap()) >= 1);
+    for st in s.documents().iter().filter(|st| st.recovered) {
+        assert!(st.by_script.is_some(), "every restored copy keeps the script's change: {}", st.title());
+    }
+}
+
+/// A copy whose details entry is missing or can't be parsed restores as a document a script
+/// opened, and so does the copy that restore writes, after a later crash; a valid details entry
+/// without the script's mark restores as the person left it.
+#[test]
+fn a_copy_without_readable_details_restores_as_a_scripts_document() {
+    let cases: [Option<&[u8]>; 3] = [Some(b"{ not json"), None, Some(b"{}")];
+    for details in cases {
+        let store = Arc::new(MemoryStore::default());
+        let mut s = session_in(&store);
+        let r = s.execute("file.recovery.save", &json!({})).unwrap();
+        let entry = format!("{}.json", r["saved"][0]["file"].as_str().unwrap());
+        drop(s);
+        match details {
+            Some(bytes) => store.write(&entry, bytes).unwrap(),
+            None => store.remove(&entry).unwrap(),
+        }
+        let by_script = details != Some(b"{}".as_slice());
+        for round in 1..=2 {
+            let mut s = relaunch(&store);
+            assert_eq!(restored(s.execute("file.recovery.restore", &json!({})).unwrap()), 1, "{details:?}, restore {round}");
+            assert_eq!(s.doc().unwrap().by_script.is_some(), by_script, "{details:?}, restore {round}");
+        }
     }
 }

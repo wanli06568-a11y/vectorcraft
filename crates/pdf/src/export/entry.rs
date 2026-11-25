@@ -1,14 +1,15 @@
 use super::writer::{Sheet, Writer, date_time};
 use super::{Affine, Document, ExportReport, Exporter, HashSet, PageBoxes, PdfError, PdfOptions, Rect, krilla, write};
-use crate::{Compatibility, PdfSettings, Standard};
+use crate::{ActiveProfiles, Compatibility, PdfSettings, Standard, page_bleed, printer_marks};
 
 /// Export `doc` as PDF bytes: one page per artboard (or the artboards chosen in `opts`).
 pub fn export(doc: &Document, opts: &PdfOptions) -> Result<Vec<u8>, PdfError> {
     export_with_report(doc, opts).map(|r| r.bytes)
 }
 
-/// Like [`export`], also returning warnings: options accepted but not applied yet (see
-/// [`crate::PdfSettings::warnings`]) and features approximated or dropped.
+/// Like [`export`], also returning warnings, features approximated or dropped, and notes on the
+/// options: options accepted but not applied yet (see [`crate::PdfSettings::warnings`]) or applied
+/// another way.
 pub fn export_with_report(doc: &Document, opts: &PdfOptions) -> Result<ExportReport, PdfError> {
     // Type in the document's composite fonts is drawn in them, whether or not an app has the document open.
     let _lent = vectorcraft_text::FontDb::global().lend_composite_fonts(&doc.composite_fonts);
@@ -42,18 +43,31 @@ pub(crate) fn leaving_out_undecodable<T>(doc: &Document, mut write: impl FnMut(&
 
 fn export_with_report_inner(doc: &Document, opts: &PdfOptions, left_out: &mut HashSet<String>) -> Result<ExportReport, PdfError> {
     let set = &opts.settings;
-    set.check()?;
+    let profiles = ActiveProfiles::default();
+    set.check(&profiles)?;
     vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
-    // Live geometry effects export as their result; raster effects are reported below.
-    let baked = vectorcraft_effects::bake_document(doc);
-    // Baking stops early when cancelled, leaving a half-baked copy that must not be written.
-    vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
-    let doc = baked.as_ref().unwrap_or(doc);
+    // The pages come from the artboards, which baking leaves as they are. The version a long page
+    // raises the file to decides whether the layers are written, so it is settled before baking.
     let pages = pages(doc, opts)?;
     let raised = for_long_pages(set, &pages)?;
     let set = raised.as_ref().unwrap_or(set);
+    // Live geometry effects export as their result, in symbols' art too; raster effects are
+    // reported below.
+    // Only the layers this export writes place their instances' art (see `ex.non_printing` and
+    // `ex.layers` below).
+    let layers = vectorcraft_effects::WrittenLayers {
+        hidden: set.writes_layers() && !doc.page_knockout,
+        non_printing: set.include_non_printing || set.create_layers,
+        hidden_objects: false,
+    };
+    let baked = vectorcraft_effects::bake_document_placing_symbols(doc, true, layers);
+    // Baking stops early when cancelled, leaving a half-baked copy that must not be written.
+    vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
+    let doc = baked.as_ref().unwrap_or(doc);
 
-    let title = crate::pdfx::title(set.standard, opts.title.clone().unwrap_or_else(|| doc.title.clone()));
+    // The file's Title is File Info's; the page information names the document, as its tab does.
+    let title = crate::pdfx::title(set.standard, opts.title.clone().unwrap_or_else(|| doc.info_title().to_owned()));
+    let name = opts.title.as_deref().unwrap_or(&doc.title);
     // The time of writing (none on the web) dates the editing data and the page information.
     let now = vectorcraft_doc::metadata::output_time();
     let created_at = opts.created.or(now);
@@ -61,9 +75,10 @@ fn export_with_report_inner(doc: &Document, opts: &PdfOptions, left_out: &mut Ha
     let display_doc_title = opts.display_doc_title || opts.title.as_deref().is_some_and(|title| !title.trim().is_empty());
     let mut w = Writer::new(doc, set, &title, created_at, doc.color_mode == vectorcraft_doc::ColorMode::Cmyk)?;
     // Preserve Editing: the native document as an embedded file (`check` refused PDF/A with it).
-    let mut warnings = set.warnings();
+    let mut warnings = vec![];
+    let mut settings: Vec<String> = set.warnings(&profiles).into_iter().map(|w| w.message).collect();
     if raised.is_some() {
-        warnings.push(if opts.settings.compatibility == Compatibility::Pdf14 {
+        settings.push(if opts.settings.compatibility == Compatibility::Pdf14 {
             "PDF 1.4 has no UserUnit, which a page longer than 14,400 pt (200 in) needs to stay within PDF/A-2's page limit of 14,400 units: the file is written as PDF 1.6".into()
         } else {
             "PDF 1.5 has no UserUnit, which a page longer than 14,400 pt (200 in) needs to keep its size: the file is written as PDF 1.6".into()
@@ -73,7 +88,7 @@ fn export_with_report_inner(doc: &Document, opts: &PdfOptions, left_out: &mut Ha
     if let Some(native) = native {
         w.pdf.document_mut().embed_file(crate::editing::embedded_file(native, set.compression.compress_text, now.map(date_time)));
     } else if set.preserve_editing {
-        warnings.push("Preserve editing needs the native document, which wasn't given: the PDF reopens as plain artwork".into());
+        settings.push("Preserve editing needs the native document, which wasn't given: the PDF reopens as plain artwork".into());
     }
 
     let mut ex = Exporter::new(doc, set);
@@ -83,11 +98,11 @@ fn export_with_report_inner(doc: &Document, opts: &PdfOptions, left_out: &mut Ha
     // A knockout page group draws the layers' objects one by one, not layer by layer.
     ex.layers = set.writes_layers() && !doc.page_knockout;
     if set.writes_layers() && doc.page_knockout {
-        warnings.push("PDF layers can't be written with a knockout page group: every layer is plain page content".into());
+        settings.push("PDF layers can't be written with a knockout page group: every layer is plain page content".into());
     }
     ex.overprint = set.advanced.overprint == crate::Overprint::Preserve;
-    let bleed = set.bleed_of(doc);
-    let marks = set.marks.printer_marks();
+    let bleed = page_bleed(&set.bleed, doc);
+    let marks = printer_marks(&set.marks);
     let scales = writes_user_units(set);
     // PDF/X files have no annotations over the art (ISO 15930: only printer's mark and trap
     // network annotations, outside the bleed box): objects' URLs aren't written as links there.
@@ -108,7 +123,7 @@ fn export_with_report_inner(doc: &Document, opts: &PdfOptions, left_out: &mut Ha
         vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
         vectorcraft_doc::cancel::progress(written as u64 + 1, total, &format!("Writing page {} of {total}", written + 1));
         let (m, r) = (boxes.media, boxes.bleed);
-        let info = if marks.page_info { crate::marks::page_info(doc, &title, i, now) } else { String::new() };
+        let info = if marks.page_info { crate::marks::page_info(doc, name, i, now) } else { String::new() };
         let art = crate::marks::art(doc, &marks, &boxes, bleed, &info);
         // The page is the media box, y down from its top-left corner (like ours), in units of
         // `unit` points.
@@ -140,7 +155,7 @@ fn export_with_report_inner(doc: &Document, opts: &PdfOptions, left_out: &mut Ha
     vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
     let (layers, overprinted, invisible) = (ex.layers, ex.overprinted, ex.invisible);
     w.absorb(ex);
-    let (bytes, more) = match w.finish(left_out, display_doc_title) {
+    let (bytes, more, catalog) = match w.finish(left_out, display_doc_title) {
         Ok(done) => done,
         Err(e) => return Err(writer_error(doc, opts, left_out, &long, e)),
     };
@@ -153,11 +168,13 @@ fn export_with_report_inner(doc: &Document, opts: &PdfOptions, left_out: &mut Ha
     // The writer's metadata has no copyright: it is added to the XMP packet.
     let bytes = crate::post::rights(bytes, &doc.metadata)?;
     warnings.extend(more);
+    settings.extend(catalog);
     let bytes = crate::post::user_units(bytes, &units)?;
     // A PDF 1.5 file written as PDF 1.6 keeps the encryption PDF 1.5 has (128-bit RC4).
-    let bytes = crate::post::finish(bytes, opts, native.is_some(), &mut warnings)?;
+    let bytes = crate::post::finish(bytes, opts, native.is_some(), &mut settings)?;
     warnings.dedup();
-    Ok(ExportReport { bytes, warnings })
+    settings.dedup();
+    Ok(ExportReport { bytes, warnings, setting_notes: settings })
 }
 
 /// The artboards `opts` exports, in page order, with the boxes of their pages: Marks and Bleeds
@@ -171,7 +188,7 @@ fn pages(doc: &Document, opts: &PdfOptions) -> Result<Vec<(usize, PageBoxes)>, P
     if doc.artboards.is_empty() || indices.is_empty() {
         return Err(PdfError::NoArtboards);
     }
-    let (bleed, marks) = (opts.settings.bleed_of(doc), opts.settings.marks.printer_marks());
+    let (bleed, marks) = (page_bleed(&opts.settings.bleed, doc), printer_marks(&opts.settings.marks));
     indices.into_iter().map(|i| Ok((i, PageBoxes::new(doc.artboards.get(i).ok_or(PdfError::BadArtboard(i))?.rect, bleed, &marks)))).collect()
 }
 
